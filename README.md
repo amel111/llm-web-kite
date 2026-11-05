@@ -12,9 +12,9 @@ tags:
 - qwen2
 ---
 
-# Temper-2-Ion
+# llm-web-kite
 
-## llm-coder web proxy (Rust)
+## llm-web-kite web proxy (Rust)
 
 This repository is the Rust/Axum rewrite of the local Ollama web proxy. It
 serves the existing ChatGPT-style UI, persists conversations in SQLite, and
@@ -40,7 +40,7 @@ The selected model and Ollama URL are stored in the local, ignored
 `settings.json`. Installed models are discovered live from Ollama.
 
 The original Flask implementation is maintained separately in
-[`Temper-2-Ion`](../Temper-2-Ion).
+[`llm-web-vela`](../llm-web-vela).
 
 Temper 2 Ion is a 0.5B parameter model for Rust code and the successor to [Temper-1-0.5B](https://huggingface.co/maylore-ai/Temper-1-0.5B). It understands requests in Russian and English and is aimed at running on weak hardware. On HumanEval-Rust it solves 32% more tasks on the first attempt than Temper-1-0.5B.
 

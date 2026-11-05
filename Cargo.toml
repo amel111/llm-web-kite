@@ -1,5 +1,5 @@
 [package]
-name = "temper-2-ion-rust"
+name = "llm-web-kite"
 version = "0.1.0"
 edition = "2024"
 
