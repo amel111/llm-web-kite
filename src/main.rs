@@ -121,10 +121,12 @@ async fn render_chat(
             con.query_row("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT 1", [], |row| row.get(0)).ok()
         })
     });
+    let conv_id_json = serde_json::to_string(&active_id).unwrap_or_else(|_| "null".to_string());
     let messages = active_id.map(list_messages).unwrap_or_default();
     let conversations = list_conversations();
     let mut context = Context::new();
     context.insert("active_id", &active_id);
+    context.insert("conv_id_json", &conv_id_json);
     context.insert("messages", &messages);
     context.insert("messages_json", &serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string()));
     let settings = state.settings.lock().await.clone();
@@ -332,7 +334,17 @@ async fn stream_chat(State(state): State<AppState>, Json(request): Json<SendRequ
     });
     let response = match reqwest::Client::new().post(format!("{ollama_url}/api/chat")).json(&payload).send().await {
         Ok(response) => response,
-        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error.to_string()).into_response(),
+        Err(error) => {
+            let mut chain = format!("{error}");
+            let mut source = std::error::Error::source(&error);
+            while let Some(cause) = source {
+                chain.push_str(" <- ");
+                chain.push_str(&format!("{cause}"));
+                source = cause.source();
+            }
+            tracing::error!("ollama chat failed: {chain}");
+            return json_error(StatusCode::BAD_GATEWAY, &chain).into_response();
+        },
     };
     let stream = response.bytes_stream().scan(
         (String::new(), String::new(), std::time::Instant::now(), false),

@@ -3,7 +3,7 @@
 {% block head %}
 <script>
 window.TEMPER = {
-  convId: {{ active_id or 'null' }},
+  convId: {{ conv_id_json|safe }},
   messages: {{ messages_json|safe }},
   model: {{ model_json|safe }},
   settings: {
