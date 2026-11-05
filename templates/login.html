@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login - llm-coder</title>
+<script>
+(function(){var t=localStorage.getItem("temper-theme")||"light";document.documentElement.setAttribute("data-theme",t);})();
+</script>
+<link rel="stylesheet" href="/static/ui.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="wordmark">llm-coder</div>
+    <p style="color:var(--text-secondary);margin:0 0 18px;font-size:14px;">Sign in to continue</p>
+    {% if error %}<div class="login-error">{{ error }}</div>{% endif %}
+    <form method="post" action="/login">
+      <input type="password" name="password" placeholder="API key / password" autofocus required>
+      <button class="btn" type="submit">Sign in</button>
+    </form>
+  </div>
+</div>
+</body>
+</html>

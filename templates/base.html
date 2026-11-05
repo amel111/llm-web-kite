@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="light">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{% block title %}Temper{% endblock %}</title>
+<script>
+(function(){var t=localStorage.getItem("temper-theme")||"light";document.documentElement.setAttribute("data-theme",t);})();
+</script>
+<link rel="stylesheet" href="/static/ui.css?v={{ V }}">
+<link rel="stylesheet" href="/static/vendor/katex.min.css">
+{% block head %}{% endblock %}
+</head>
+<body>
+{% block body %}{% endblock %}
+<div class="snackbar" id="snack"></div>
+<script>
+function snack(msg){var e=document.getElementById("snack");e.textContent=msg;e.classList.add("show");setTimeout(function(){e.classList.remove("show");},2500);}
+</script>
+<script src="/static/vendor/marked.min.js"></script>
+<script src="/static/vendor/purify.min.js"></script>
+<script src="/static/vendor/highlight.min.js"></script>
+<script src="/static/vendor/rust.min.js"></script>
+<script src="/static/vendor/katex.min.js"></script>
+<script src="/static/vendor/katex-auto-render.min.js"></script>
+{% block scripts %}{% endblock %}
+<script src="/static/app.js?v={{ V }}"></script>
+</body>
+</html>

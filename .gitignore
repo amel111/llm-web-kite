@@ -1,0 +1,16 @@
+__pycache__/
+.superpowers/
+settings.json
+usage_export.csv
+usage.db
+usage.log
+cookies.txt
+codebase-walkthrough.json
+monitor.py
+temper.py
+proxy.py
+
+
+# Added by cargo
+
+/target

@@ -1,0 +1,10 @@
+Vendored third-party libraries, pinned versions, licenses.
+
+marked 12.0.2          https://github.com/markedjs/marked      MIT
+dompurify 3.1.6        https://github.com/cure53/DOMPurify    MPL-2.0 OR Apache-2.0
+highlight.js 11.9.0    https://github.com/highlightjs/highlight.js  BSD-3-Clause
+  (cdn-assets common bundle + rust language grammar)
+
+Sources: https://cdn.jsdelivr.net/npm/
+Downloaded 2026-11-04. Update by replacing the .min.js files and bumping
+the version here.
