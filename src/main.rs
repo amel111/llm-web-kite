@@ -1,7 +1,8 @@
 use axum::{
     body::Body,
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{Html, IntoResponse, Redirect, Response},
     routing::{delete, get, post},
     Json, Router,
@@ -11,7 +12,7 @@ use futures_util::StreamExt;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
 use tera::{Context, Tera};
 use tokio::sync::Mutex;
 use tower_http::{services::ServeDir, trace::TraceLayer};
@@ -62,21 +63,62 @@ fn init_db() -> rusqlite::Result<()> {
          );
          CREATE TABLE IF NOT EXISTS usage (
            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, model TEXT,
-           prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,
-           total_tokens INTEGER DEFAULT 0, elapsed_s REAL, endpoint TEXT
+           prompt_tokens INTEGER, completion_tokens INTEGER,
+           total_tokens INTEGER, elapsed_s REAL, endpoint TEXT
          );",
     )
 }
 
-fn is_authed(jar: &CookieJar, headers: &axum::http::HeaderMap) -> bool {
-    let api_key = std::env::var("PROXY_API_KEY").unwrap_or_else(|_| "change-me".to_string());
-    jar.get("rust_authed").is_some()
-        || headers
-            .get("authorization")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(|v| v == api_key)
-            .unwrap_or(false)
+fn now_unix() -> f64 {
+    chrono::Utc::now().timestamp_millis() as f64 / 1000.0
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+fn record_usage(model: &str, pt: i64, ct: i64, elapsed: f64, endpoint: &str) {
+    if let Ok(con) = Connection::open(DB_PATH) {
+        con.execute(
+            "INSERT INTO usage (ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint) VALUES (?,?,?,?,?,?,?)",
+            params![now_unix(), model, pt, ct, pt + ct, elapsed, endpoint],
+        ).ok();
+    }
+}
+
+fn touch_conversation(cid: i64) {
+    if let Ok(con) = Connection::open(DB_PATH) {
+        con.execute("UPDATE conversations SET updated_at=? WHERE id=?", params![now_unix(), cid]).ok();
+    }
+}
+
+fn error_chain(error: &dyn std::error::Error) -> String {
+    let mut chain = format!("{error}");
+    let mut source = error.source();
+    while let Some(cause) = source {
+        chain.push_str(" <- ");
+        chain.push_str(&format!("{cause}"));
+        source = cause.source();
+    }
+    chain
+}
+
+// ---- auth: same rules as the Python before_request ----
+fn api_key_config() -> String {
+    std::env::var("PROXY_API_KEY").unwrap_or_else(|_| "change-me".to_string())
+}
+
+fn web_password() -> String {
+    std::env::var("WEB_PASSWORD").unwrap_or_else(|_| api_key_config())
+}
+
+fn bearer_or_header_ok(headers: &axum::http::HeaderMap, api_key: &str) -> bool {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|v| v.trim() == api_key)
+        .unwrap_or(false)
         || headers
             .get("x-api-key")
             .and_then(|v| v.to_str().ok())
@@ -84,6 +126,43 @@ fn is_authed(jar: &CookieJar, headers: &axum::http::HeaderMap) -> bool {
             .unwrap_or(false)
 }
 
+async fn auth_middleware(request: Request, next: Next) -> Response {
+    let path = request.uri().path().to_string();
+    let skipped = path == "/health"
+        || path == "/login"
+        || path == "/logout"
+        || path == "/login?error=1"
+        || path.starts_with("/static/");
+    if skipped {
+        return next.run(request).await;
+    }
+    let api_key = api_key_config();
+    let cookie_ok = request
+        .headers()
+        .get(header::COOKIE)
+        .and_then(|v| v.to_str().ok())
+        .map(|value| {
+            value.split(';').any(|part| part.trim() == "rust_authed=1")
+        })
+        .unwrap_or(false);
+    let authed = cookie_ok || bearer_or_header_ok(request.headers(), &api_key);
+    if authed {
+        return next.run(request).await;
+    }
+    if path == "/" || path == "/settings" || path.starts_with("/chat") {
+        return Redirect::to("/login").into_response();
+    }
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"error": {"message": "invalid api key", "type": "auth_error"}})),
+    ).into_response()
+}
+
+fn is_authed(jar: &CookieJar, headers: &axum::http::HeaderMap) -> bool {
+    jar.get("rust_authed").is_some() || bearer_or_header_ok(headers, &api_key_config())
+}
+
+// ---- template render ----
 #[derive(Deserialize)]
 struct ConvQuery {
     conv: Option<i64>,
@@ -95,7 +174,7 @@ async fn web_chat(
     headers: axum::http::HeaderMap,
     Query(query): Query<ConvQuery>,
 ) -> Response {
-    render_chat(state, jar, headers, query.conv).await
+    render_chat(state, jar, headers, query.conv, false).await
 }
 
 async fn chat_by_id(
@@ -104,7 +183,15 @@ async fn chat_by_id(
     headers: axum::http::HeaderMap,
     Path(id): Path<i64>,
 ) -> Response {
-    render_chat(state, jar, headers, Some(id)).await
+    render_chat(state, jar, headers, Some(id), false).await
+}
+
+async fn chat_new(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    headers: axum::http::HeaderMap,
+) -> Response {
+    render_chat(state, jar, headers, None, true).await
 }
 
 async fn render_chat(
@@ -112,15 +199,20 @@ async fn render_chat(
     jar: CookieJar,
     headers: axum::http::HeaderMap,
     requested_id: Option<i64>,
+    is_new: bool,
 ) -> Response {
     if !is_authed(&jar, &headers) {
         return Redirect::to("/login").into_response();
     }
-    let active_id = requested_id.or_else(|| {
-        Connection::open(DB_PATH).ok().and_then(|con| {
-            con.query_row("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT 1", [], |row| row.get(0)).ok()
+    let active_id = if is_new {
+        None
+    } else {
+        requested_id.or_else(|| {
+            Connection::open(DB_PATH).ok().and_then(|con| {
+                con.query_row("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT 1", [], |row| row.get(0)).ok()
+            })
         })
-    });
+    };
     let conv_id_json = serde_json::to_string(&active_id).unwrap_or_else(|_| "null".to_string());
     let messages = active_id.map(list_messages).unwrap_or_default();
     let conversations = list_conversations();
@@ -130,8 +222,8 @@ async fn render_chat(
     context.insert("messages", &messages);
     context.insert("messages_json", &serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string()));
     let settings = state.settings.lock().await.clone();
-    context.insert("model_json", &serde_json::to_string(&settings["model"]).unwrap_or_else(|_| "\"temper-2-ion\"".to_string()));
-    context.insert("ollama_json", &serde_json::to_string(&settings["ollama_url"]).unwrap_or_else(|_| "\"http://127.0.0.1:11434\"".to_string()));
+    context.insert("model_json", &serde_json::to_string(&settings["model"]).unwrap_or_else(|_| format!("\"{MODEL}\"")));
+    context.insert("ollama_json", &serde_json::to_string(&settings["ollama_url"]).unwrap_or_else(|_| format!("\"{OLLAMA_URL}\"")));
     context.insert("conv_groups", &json!({"Today": conversations}));
     context.insert("settings", &settings);
     context.insert("V", "rust");
@@ -195,8 +287,7 @@ struct LoginForm {
 }
 
 async fn login_post(jar: CookieJar, axum::Form(form): axum::Form<LoginForm>) -> (CookieJar, Redirect) {
-    let api_key = std::env::var("PROXY_API_KEY").unwrap_or_else(|_| "change-me".to_string());
-    if form.password == api_key {
+    if form.password == web_password() {
         return (jar.add(Cookie::new("rust_authed", "1")), Redirect::to("/"));
     }
     (jar, Redirect::to("/login"))
@@ -206,9 +297,13 @@ async fn logout(jar: CookieJar) -> (CookieJar, Redirect) {
     (jar.remove(Cookie::from("rust_authed")), Redirect::to("/login"))
 }
 
-async fn models() -> Json<Value> {
-    let result = reqwest::get(format!("{OLLAMA_URL}/api/tags")).await;
-    let tags = match result {
+// ---- models (Ollama-backed, settings-aware) ----
+async fn models(State(state): State<AppState>) -> Json<Value> {
+    let ollama_url = {
+        let settings = state.settings.lock().await;
+        settings_string(&settings, "ollama_url", OLLAMA_URL)
+    };
+    let tags = match reqwest::get(format!("{ollama_url}/api/tags")).await {
         Ok(response) => response.json::<Value>().await.unwrap_or_else(|_| json!({"models": []})),
         Err(_) => json!({"models": []}),
     };
@@ -222,9 +317,16 @@ async fn models() -> Json<Value> {
     Json(json!({"object": "list", "data": if data.is_empty() { vec![json!({"id": MODEL, "object": "model", "owned_by": "ollama"})] } else { data }}))
 }
 
-async fn model_status() -> Json<Value> {
-    let response = reqwest::get(format!("{OLLAMA_URL}/api/ps")).await;
-    let running: Vec<String> = match response {
+fn settings_string(settings: &Value, key: &str, fallback: &str) -> String {
+    settings[key].as_str().unwrap_or(fallback).to_string()
+}
+
+fn settings_number(settings: &Value, key: &str, fallback: f64) -> f64 {
+    settings[key].as_f64().unwrap_or(fallback)
+}
+
+async fn running_model_names(ollama_url: &str) -> Vec<String> {
+    match reqwest::get(format!("{ollama_url}/api/ps")).await {
         Ok(response) => response.json::<Value>().await.ok()
             .and_then(|value| value["models"].as_array().cloned())
             .unwrap_or_default()
@@ -232,18 +334,29 @@ async fn model_status() -> Json<Value> {
             .filter_map(|model| model["name"].as_str().map(str::to_string))
             .collect(),
         Err(_) => Vec::new(),
+    }
+}
+
+async fn model_status(State(state): State<AppState>) -> Json<Value> {
+    let (configured, ollama_url) = {
+        let settings = state.settings.lock().await;
+        (settings_string(&settings, "model", MODEL), settings_string(&settings, "ollama_url", OLLAMA_URL))
     };
-    let configured = MODEL.to_string();
+    let running = running_model_names(&ollama_url).await;
     let base = configured.split(':').next().unwrap_or(&configured);
     let loaded = running.iter().any(|name| name == &configured || name.split(':').next() == Some(base));
     Json(json!({"model": configured, "loaded": loaded, "running": running}))
 }
 
-async fn new_conversation() -> Json<Value> {
-    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
+async fn new_conversation(State(state): State<AppState>) -> Json<Value> {
+    let model = {
+        let settings = state.settings.lock().await;
+        settings_string(&settings, "model", MODEL)
+    };
+    let now = now_unix();
     let con = Connection::open(DB_PATH).expect("open database");
     con.execute("INSERT INTO conversations (title, model, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        params!["", MODEL, now, now]).expect("create conversation");
+        params![Option::<String>::None, model, now, now]).expect("create conversation");
     Json(json!({"id": con.last_insert_rowid()}))
 }
 
@@ -265,11 +378,78 @@ async fn rename_conversation(Path(id): Path<i64>, Json(request): Json<RenameRequ
         return json_error(StatusCode::BAD_REQUEST, "missing title").into_response();
     }
     match Connection::open(DB_PATH).and_then(|con| {
-        con.execute("UPDATE conversations SET title=?, updated_at=? WHERE id=?",
-            params![title.chars().take(80).collect::<String>(), chrono::Utc::now().timestamp_millis() as f64 / 1000.0, id])
+        con.execute("UPDATE conversations SET title=? WHERE id=?",
+            params![truncate_chars(title, 80), id])
     }) {
         Ok(_) => Json(json!({"ok": true})).into_response(),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
+    }
+}
+
+fn add_message(
+    cid: i64,
+    role: &str,
+    content: &str,
+    pt: i64,
+    ct: i64,
+    model: Option<&str>,
+    elapsed: Option<f64>,
+    branch_of: Option<i64>,
+    branch_group: Option<i64>,
+) -> i64 {
+    let con = Connection::open(DB_PATH).expect("open database");
+    con.execute(
+        "INSERT INTO messages (conversation_id,role,content,prompt_tokens,completion_tokens,created_at,model,elapsed_s,branch_of,branch_group)
+         VALUES (?,?,?,?,?,?,?,?,?,?)",
+        params![cid, role, content, pt, ct, now_unix(), model, elapsed, branch_of, branch_group],
+    ).expect("insert message");
+    con.last_insert_rowid()
+}
+
+// ---- selection of the same model settings as the web UI ----
+fn chat_options(settings: &Value) -> Value {
+    json!({
+        "num_predict": settings_number(settings, "max_tokens", 1000.0),
+        "num_ctx": settings_number(settings, "num_ctx", 32768.0),
+        "temperature": settings_number(settings, "temperature", 0.2),
+        "top_p": settings_number(settings, "top_p", 0.8),
+        "top_k": settings_number(settings, "top_k", 20.0),
+        "repeat_penalty": settings_number(settings, "repeat_penalty", 1.05)
+    })
+}
+
+// Latest active user version per branch, preserving order (matches the Python
+// _active_chat_messages logic used by the shared web UI).
+fn active_chat_history(cid: i64) -> Value {
+    let messages = list_messages(cid);
+    let mut latest: HashMap<i64, i64> = HashMap::new();
+    for m in &messages {
+        if m["role"].as_str() != Some("user") {
+            continue;
+        }
+        let mid = m["id"].as_i64().unwrap_or(0);
+        let key = m["branch_group"].as_i64().or_else(|| m["branch_of"].as_i64()).unwrap_or(mid);
+        latest.insert(key, mid);
+    }
+    let history: Vec<Value> = messages.into_iter()
+        .filter(|m| {
+            if m["role"].as_str() != Some("user") {
+                return true;
+            }
+            let mid = m["id"].as_i64().unwrap_or(0);
+            let key = m["branch_group"].as_i64().or_else(|| m["branch_of"].as_i64()).unwrap_or(mid);
+            latest.get(&key) == Some(&mid)
+        })
+        .filter_map(|m| {
+            let role = m["role"].as_str()?;
+            let content = m["content"].as_str()?;
+            Some(json!({"role": role, "content": content}))
+        })
+        .collect();
+    if history.is_empty() {
+        json!([{"role": "user", "content": ""}])
+    } else {
+        Value::Array(history)
     }
 }
 
@@ -279,108 +459,218 @@ struct SendRequest {
     message: Option<String>,
     content: Option<String>,
     message_id: Option<i64>,
+    #[serde(default)]
+    skip_add_user: bool,
 }
 
-fn add_message(cid: i64, role: &str, content: &str, model: Option<&str>, elapsed: Option<f64>) -> i64 {
-    let now = chrono::Utc::now().timestamp_millis() as f64 / 1000.0;
-    let con = Connection::open(DB_PATH).expect("open database");
-    con.execute(
-        "INSERT INTO messages (conversation_id,role,content,created_at,model,elapsed_s) VALUES (?,?,?,?,?,?)",
-        params![cid, role, content, now, model, elapsed],
-    ).expect("insert message");
-    con.last_insert_rowid()
+#[derive(Clone, Copy)]
+enum SseMode {
+    Web { cid: i64, endpoint: &'static str },
+    OpenAI,
 }
 
-fn settings_number(settings: &Value, key: &str, fallback: f64) -> f64 {
-    settings[key].as_f64().unwrap_or(fallback)
+struct StreamState {
+    buf: String,
+    full: String,
+    start: Instant,
+    done: bool,
+    pt: i64,
+    ct: i64,
+    eval_s: Option<f64>,
+    model: String,
+    mode: SseMode,
 }
 
-fn settings_string(settings: &Value, key: &str, fallback: &str) -> String {
-    settings[key].as_str().unwrap_or(fallback).to_string()
-}
-
-fn chat_history(cid: i64) -> Vec<Value> {
-    list_messages(cid).into_iter()
-        .filter_map(|m| Some(json!({"role": m["role"].as_str()?, "content": m["content"].as_str()?})))
-        .collect()
-}
-
-async fn stream_chat(State(state): State<AppState>, Json(request): Json<SendRequest>) -> Response {
-    let content = request.content.or(request.message).unwrap_or_default().trim().to_string();
-    if content.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "missing message").into_response();
-    }
-    let cid = request.conversation_id;
-    if request.message_id.is_some() {
-        let con = Connection::open(DB_PATH).expect("open database");
-        con.execute("DELETE FROM messages WHERE conversation_id=? AND id>?", params![cid, request.message_id]).ok();
-    }
-    add_message(cid, "user", &content, None, None);
-    let settings = state.settings.lock().await.clone();
-    let model = settings_string(&settings, "model", MODEL);
-    let ollama_url = settings_string(&settings, "ollama_url", OLLAMA_URL);
-    let payload = json!({
-        "model": model,
-        "messages": chat_history(cid),
-        "stream": true,
-        "options": {
-            "num_predict": settings_number(&settings, "max_tokens", 1000.0),
-            "num_ctx": settings_number(&settings, "num_ctx", 32768.0),
-            "temperature": settings_number(&settings, "temperature", 0.2),
-            "top_p": settings_number(&settings, "top_p", 0.8),
-            "top_k": settings_number(&settings, "top_k", 20.0),
-            "repeat_penalty": settings_number(&settings, "repeat_penalty", 1.05)
-        }
-    });
-    let response = match reqwest::Client::new().post(format!("{ollama_url}/api/chat")).json(&payload).send().await {
-        Ok(response) => response,
-        Err(error) => {
-            let mut chain = format!("{error}");
-            let mut source = std::error::Error::source(&error);
-            while let Some(cause) = source {
-                chain.push_str(" <- ");
-                chain.push_str(&format!("{cause}"));
-                source = cause.source();
-            }
-            tracing::error!("ollama chat failed: {chain}");
-            return json_error(StatusCode::BAD_GATEWAY, &chain).into_response();
-        },
-    };
+fn sse_response(response: reqwest::Response, model: String, mode: SseMode) -> Response {
+    let start = Instant::now();
     let stream = response.bytes_stream().scan(
-        (String::new(), String::new(), std::time::Instant::now(), false),
+        StreamState {
+            buf: String::new(),
+            full: String::new(),
+            start,
+            done: false,
+            pt: 0,
+            ct: 0,
+            eval_s: None,
+            model,
+            mode,
+        },
         move |state, chunk| {
-        let result = match chunk {
-            Ok(bytes) => {
-                state.0.push_str(&String::from_utf8_lossy(&bytes));
-                let mut output = String::new();
-                while let Some(pos) = state.0.find('\n') {
-                    let line = state.0[..pos].trim().to_string();
-                    state.0.drain(..=pos);
-                    if let Ok(value) = serde_json::from_str::<Value>(&line) {
-                        if let Some(delta) = value["message"]["content"].as_str() {
-                            state.1.push_str(delta);
+            let result = match chunk {
+                Ok(bytes) => {
+                    state.buf.push_str(&String::from_utf8_lossy(&bytes));
+                    let mut output = String::new();
+                    while let Some(pos) = state.buf.find('\n') {
+                        let line = state.buf[..pos].trim().to_string();
+                        state.buf.drain(..=pos);
+                        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+                        if let Some(delta) = value["message"]["content"].as_str().filter(|c| !c.is_empty()) {
+                            state.full.push_str(delta);
+                            let chunk_id = match state.mode {
+                                SseMode::Web { .. } => format!("c-{}", chrono::Utc::now().timestamp_millis()),
+                                SseMode::OpenAI => format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
+                            };
                             output.push_str(&format!("data: {}\n\n", json!({
-                                "choices": [{"delta": {"content": delta}, "finish_reason": null}]
+                                "id": chunk_id,
+                                "object": "chat.completion.chunk",
+                                "created": chrono::Utc::now().timestamp(),
+                                "model": state.model,
+                                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
                             })));
                         }
-                        if value["done"].as_bool() == Some(true) && !state.3 {
-                            state.3 = true;
-                            add_message(cid, "assistant", &state.1, Some(&model), Some(state.2.elapsed().as_secs_f64()));
+                        if value["done"].as_bool() == Some(true) && !state.done {
+                            state.done = true;
+                            state.pt = value["prompt_eval_count"].as_i64().unwrap_or(0);
+                            state.ct = value["eval_count"].as_i64().unwrap_or(0);
+                            state.eval_s = value["eval_duration"].as_f64().map(|d| d / 1e9);
+                            let elapsed = state.eval_s.unwrap_or_else(|| state.start.elapsed().as_secs_f64());
+                            let model = state.model.clone();
+                            match state.mode {
+                                SseMode::Web { cid, endpoint } => {
+                                    let full = state.full.clone();
+                                    add_message(cid, "assistant", &full, state.pt, state.ct, Some(&model), Some(elapsed), None, None);
+                                    touch_conversation(cid);
+                                    record_usage(&model, state.pt, state.ct, elapsed, endpoint);
+                                    output.push_str(&format!("data: {}\n\n", json!({
+                                        "id": format!("c-{}", chrono::Utc::now().timestamp_millis()),
+                                        "object": "chat.completion.chunk",
+                                        "created": chrono::Utc::now().timestamp(),
+                                        "model": model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                        "usage": {
+                                            "prompt_tokens": state.pt,
+                                            "completion_tokens": state.ct,
+                                            "total_tokens": state.pt + state.ct,
+                                            "model": model,
+                                            "elapsed_s": (elapsed * 1000.0).round() / 1000.0
+                                        }
+                                    })));
+                                }
+                                SseMode::OpenAI => {
+                                    record_usage(&model, state.pt, state.ct, elapsed, "/v1/chat/completions");
+                                    output.push_str(&format!("data: {}\n\n", json!({
+                                        "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
+                                        "object": "chat.completion.chunk",
+                                        "created": chrono::Utc::now().timestamp(),
+                                        "model": model,
+                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                                        "usage": {
+                                            "prompt_tokens": state.pt,
+                                            "completion_tokens": state.ct,
+                                            "total_tokens": state.pt + state.ct
+                                        }
+                                    })));
+                                }
+                            }
                             output.push_str("data: [DONE]\n\n");
                         }
-
                     }
+                    Ok::<_, std::io::Error>(output)
                 }
-                Ok::<_, std::io::Error>(output)
-            }
-            Err(error) => Err(std::io::Error::other(error)),
-        };
-        futures_util::future::ready(Some(result))
-    });
+                Err(error) => {
+                    state.done = true;
+                    let message = error_chain(&error);
+                    Ok::<_, std::io::Error>(format!("data: {}\n\n", json!({"error": message})))
+                }
+            };
+            futures_util::future::ready(Some(result))
+        },
+    );
     (
         [(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))],
         Body::from_stream(stream),
     ).into_response()
+}
+
+async fn stream_chat(State(state): State<AppState>, Json(request): Json<SendRequest>) -> Response {
+    let content = request.content.clone()
+        .or_else(|| request.message.clone())
+        .map(|c| c.trim().to_string())
+        .unwrap_or_default();
+    if content.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "missing message").into_response();
+    }
+    let cid = request.conversation_id;
+    let settings = state.settings.lock().await.clone();
+    let model = settings_string(&settings, "model", MODEL);
+    let ollama_url = settings_string(&settings, "ollama_url", OLLAMA_URL);
+
+    // Edit path: keep the original as an older version (branch) and remove the
+    // old response branch, mirroring the Python backend.
+    let mut message_id: Option<i64> = None;
+    if let Some(mid) = request.message_id {
+        let con = match Connection::open(DB_PATH) {
+            Ok(con) => con,
+            Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
+        };
+        let orig = con.query_row(
+            "SELECT role, branch_of, branch_group FROM messages WHERE id=? AND conversation_id=?",
+            params![mid, cid],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?)),
+        );
+        match orig {
+            Ok((role, orig_branch_of, orig_branch_group)) => {
+                if role != "user" {
+                    return json_error(StatusCode::BAD_REQUEST, "can only edit user messages").into_response();
+                }
+                message_id = Some(mid);
+                if request.message_id.is_some() {
+                    con.execute("DELETE FROM messages WHERE conversation_id=? AND id>?", params![cid, mid]).ok();
+                }
+                if !request.skip_add_user {
+                    let branch_of = orig_branch_of.unwrap_or(mid);
+                    let branch_group = orig_branch_group.unwrap_or(mid);
+                    add_message(cid, "user", &content, 0, 0, None, None, Some(branch_of), Some(branch_group));
+                    con.execute("UPDATE conversations SET title=? WHERE id=?", params![truncate_chars(&content, 40), cid]).ok();
+                }
+            }
+            Err(_) => return json_error(StatusCode::NOT_FOUND, "not found").into_response(),
+        }
+    }
+    if message_id.is_none() && !request.skip_add_user {
+        add_message(cid, "user", &content, 0, 0, None, None, None, None);
+        let con = Connection::open(DB_PATH).expect("open database");
+        con.execute(
+            "UPDATE conversations SET title=? WHERE id=? AND (title IS NULL OR title='')",
+            params![truncate_chars(&content, 40), cid],
+        ).ok();
+    }
+
+    let endpoint: &'static str = if request.message_id.is_some() {
+        if request.skip_add_user { "/web/regenerate" } else { "/web/edit" }
+    } else if request.skip_add_user {
+        "/web/regenerate"
+    } else {
+        "/web/chat"
+    };
+
+    let payload = json!({
+        "model": model,
+        "messages": active_chat_history(cid),
+        "stream": true,
+        "options": chat_options(&settings)
+    });
+    let response = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(300))
+        .build()
+        .expect("build ollama client")
+        .post(format!("{ollama_url}/api/chat"))
+        .json(&payload)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            let chain = error_chain(&error);
+            tracing::error!("ollama chat failed: {chain}");
+            return json_error(StatusCode::BAD_GATEWAY, &chain).into_response();
+        },
+    };
+    if !response.status().is_success() {
+        return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
+    }
+    sse_response(response, model, SseMode::Web { cid, endpoint })
 }
 
 async fn regenerate(State(state): State<AppState>, Json(request): Json<SendRequest>) -> Response {
@@ -404,32 +694,58 @@ async fn regenerate(State(state): State<AppState>, Json(request): Json<SendReque
             message: None,
             content: last_user["content"].as_str().map(str::to_string),
             message_id: None,
+            skip_add_user: true,
         }),
     ).await
 }
 
+// ---- model load/unload (checks Ollama state first, like the Python version) ----
 #[derive(Deserialize)]
 struct ModelRequest {
     model: Option<String>,
 }
 
-async fn model_load(Json(request): Json<ModelRequest>) -> Response {
-    let model = request.model.unwrap_or_else(|| MODEL.to_string());
-    match reqwest::Client::new().post(format!("{OLLAMA_URL}/api/generate"))
-        .json(&json!({"model": model, "prompt": "hi"})).send().await {
-        Ok(response) if response.status().is_success() => Json(json!({"ok": true, "model": model})).into_response(),
+async fn model_load(State(state): State<AppState>, Json(request): Json<ModelRequest>) -> Response {
+    let (want, ollama_url) = {
+        let settings = state.settings.lock().await;
+        (request.model.clone().unwrap_or_else(|| settings_string(&settings, "model", MODEL)),
+         settings_string(&settings, "ollama_url", OLLAMA_URL))
+    };
+    let loaded = running_model_names(&ollama_url).await.iter().any(|name| {
+        let base = want.split(':').next().unwrap_or(&want);
+        name == &want || name.split(':').next() == Some(base)
+    });
+    if loaded {
+        return Json(json!({"ok": true, "model": want})).into_response();
+    }
+    match reqwest::Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .expect("build ollama client")
+        .post(format!("{ollama_url}/api/generate"))
+        .json(&json!({"model": want, "prompt": "hi"}))
+        .send().await {
+        Ok(response) if response.status().is_success() => Json(json!({"ok": true, "model": want})).into_response(),
         Ok(response) => json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response(),
-        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()).into_response(),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error_chain(&error)).into_response(),
     }
 }
 
-async fn model_unload(Json(request): Json<ModelRequest>) -> Response {
-    let model = request.model.unwrap_or_else(|| MODEL.to_string());
-    match reqwest::Client::new().post(format!("{OLLAMA_URL}/api/generate"))
+async fn model_unload(State(state): State<AppState>, Json(request): Json<ModelRequest>) -> Response {
+    let (model, ollama_url) = {
+        let settings = state.settings.lock().await;
+        (request.model.clone().unwrap_or_else(|| settings_string(&settings, "model", MODEL)),
+         settings_string(&settings, "ollama_url", OLLAMA_URL))
+    };
+    match reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .expect("build ollama client")
+        .post(format!("{ollama_url}/api/generate"))
         .json(&json!({"model": model, "prompt": "", "keep_alive": 0})).send().await {
         Ok(response) if response.status().is_success() => Json(json!({"ok": true})).into_response(),
         Ok(response) => json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response(),
-        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error.to_string()).into_response(),
+        Err(error) => json_error(StatusCode::BAD_GATEWAY, &error_chain(&error)).into_response(),
     }
 }
 
@@ -450,8 +766,12 @@ async fn save_settings(State(state): State<AppState>, Json(input): Json<Value>) 
     }
 }
 
-async fn test_settings(Json(input): Json<Value>) -> Json<Value> {
-    let url = input["ollama_url"].as_str().unwrap_or(OLLAMA_URL).trim_end_matches('/');
+async fn test_settings(State(state): State<AppState>, Json(input): Json<Value>) -> Json<Value> {
+    let fallback = {
+        let settings = state.settings.lock().await;
+        settings_string(&settings, "ollama_url", OLLAMA_URL)
+    };
+    let url = input["ollama_url"].as_str().unwrap_or(&fallback).trim_end_matches('/');
     match reqwest::get(format!("{url}/api/tags")).await {
         Ok(response) if response.status().is_success() => {
             let count = response.json::<Value>().await.ok()
@@ -463,9 +783,13 @@ async fn test_settings(Json(input): Json<Value>) -> Json<Value> {
     }
 }
 
-async fn stats() -> Json<Value> {
-    let con = Connection::open(DB_PATH).ok();
-    let totals = con.as_ref().and_then(|connection| connection.query_row(
+// ---- stats: totals + recent requests, and CSV export ----
+async fn stats() -> Response {
+    let Ok(con) = Connection::open(DB_PATH) else {
+        let zero = json!({"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+        return Json(json!({"totals": zero, "recent": [], "session": zero})).into_response();
+    };
+    let totals = con.query_row(
         "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(prompt_tokens+completion_tokens),0) FROM usage",
         [], |row| Ok(json!({
             "requests": row.get::<_, i64>(0)?,
@@ -473,23 +797,103 @@ async fn stats() -> Json<Value> {
             "completion_tokens": row.get::<_, i64>(2)?,
             "total_tokens": row.get::<_, i64>(3)?
         }))
-    ).ok()).unwrap_or_else(|| json!({"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
-    Json(json!({"totals": totals, "recent": [], "session": totals}))
+    ).unwrap_or_else(|_| json!({"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
+    let Ok(mut statement) = con.prepare(
+        "SELECT ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint FROM usage ORDER BY id DESC LIMIT 50"
+    ) else {
+        return Json(json!({"totals": totals, "recent": [], "session": totals})).into_response();
+    };
+    let recent: Vec<Value> = statement.query_map([], |row| {
+        Ok(json!({
+            "ts": row.get::<_, f64>(0)?,
+            "model": row.get::<_, Option<String>>(1)?,
+            "prompt_tokens": row.get::<_, i64>(2)?,
+            "completion_tokens": row.get::<_, i64>(3)?,
+            "total_tokens": row.get::<_, i64>(4)?,
+            "elapsed_s": row.get::<_, Option<f64>>(5)?,
+            "endpoint": row.get::<_, Option<String>>(6)?
+        }))
+    }).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default();
+    Json(json!({"totals": totals, "recent": recent, "session": totals})).into_response()
 }
 
-async fn openai_chat(Json(input): Json<Value>) -> Response {
-    let model = input["model"].as_str().unwrap_or(MODEL);
-    let messages = input["messages"].as_array().cloned().unwrap_or_default();
-    let payload = json!({"model": model, "messages": messages, "stream": false, "options": {
+async fn stats_export() -> Response {
+    let mut body = String::from("ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint\n");
+    if let Ok(con) = Connection::open(DB_PATH) {
+        if let Ok(mut statement) = con.prepare(
+            "SELECT ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint FROM usage ORDER BY id"
+        ) {
+            let rows: Vec<String> = statement.query_map([], |row| {
+                let ts: f64 = row.get(0)?;
+                let model: Option<String> = row.get(1)?;
+                let pt: i64 = row.get(2)?;
+                let ct: i64 = row.get(3)?;
+                let tt: i64 = row.get(4)?;
+                let elapsed: Option<f64> = row.get(5)?;
+                let endpoint: Option<String> = row.get(6)?;
+                Ok(vec![
+                    format!("{ts}"),
+                    model.unwrap_or_default(),
+                    format!("{pt}"),
+                    format!("{ct}"),
+                    format!("{tt}"),
+                    elapsed.map(|e| format!("{e}")).unwrap_or_default(),
+                    endpoint.unwrap_or_default(),
+                ].join(","))
+            }).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default();
+            for row in rows {
+                body.push_str(&row);
+                body.push('\n');
+            }
+        }
+    }
+    (
+        [
+            (header::CONTENT_TYPE, HeaderValue::from_static("text/csv")),
+            (header::CONTENT_DISPOSITION, HeaderValue::from_static("attachment; filename=usage.csv")),
+        ],
+        body,
+    ).into_response()
+}
+
+// ---- OpenAI-compatible API ----
+fn build_chat_options(input: &Value) -> Value {
+    json!({
         "temperature": input["temperature"].as_f64().unwrap_or(0.2),
         "top_p": input["top_p"].as_f64().unwrap_or(0.8),
         "top_k": input["top_k"].as_i64().unwrap_or(20),
         "repeat_penalty": input["repeat_penalty"].as_f64().unwrap_or(1.05),
         "num_predict": input["max_tokens"].as_i64().unwrap_or(1000)
-    }});
-    let response = match reqwest::Client::new().post(format!("{OLLAMA_URL}/api/chat")).json(&payload).send().await {
+    })
+}
+
+async fn openai_chat(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let model = input["model"].as_str().unwrap_or(MODEL).to_string();
+    let messages = input["messages"].as_array().cloned().unwrap_or_default();
+    let ollama_url = {
+        let settings = state.settings.lock().await;
+        settings_string(&settings, "ollama_url", OLLAMA_URL)
+    };
+    let wants_stream = input["stream"].as_bool().unwrap_or(false);
+    let payload = if wants_stream {
+        json!({"model": model, "messages": messages, "stream": true, "options": build_chat_options(&input)})
+    } else {
+        json!({"model": model, "messages": messages, "stream": false, "options": build_chat_options(&input)})
+    };
+    if wants_stream {
+        let response = match reqwest::Client::new().post(format!("{ollama_url}/api/chat")).json(&payload).send().await {
+            Ok(response) => response,
+            Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error_chain(&error)).into_response(),
+        };
+        if !response.status().is_success() {
+            return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
+        }
+        return sse_response(response, model, SseMode::OpenAI);
+    }
+    let started = Instant::now();
+    let response = match reqwest::Client::new().post(format!("{ollama_url}/api/chat")).json(&payload).send().await {
         Ok(response) => response,
-        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error.to_string()).into_response(),
+        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error_chain(&error)).into_response(),
     };
     if !response.status().is_success() {
         return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
@@ -499,10 +903,7 @@ async fn openai_chat(Json(input): Json<Value>) -> Response {
     let prompt_tokens = body["prompt_eval_count"].as_i64().unwrap_or(0);
     let completion_tokens = body["eval_count"].as_i64().unwrap_or(0);
     let total = prompt_tokens + completion_tokens;
-    if let Ok(con) = Connection::open(DB_PATH) {
-        con.execute("INSERT INTO usage (ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint) VALUES (?,?,?,?,?,?,?)",
-            params![chrono::Utc::now().timestamp_millis() as f64 / 1000.0, model, prompt_tokens, completion_tokens, total, 0.0, "/v1/chat/completions"]).ok();
-    }
+    record_usage(&model, prompt_tokens, completion_tokens, started.elapsed().as_secs_f64(), "/v1/chat/completions");
     Json(json!({
         "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
         "object": "chat.completion", "created": chrono::Utc::now().timestamp(),
@@ -512,30 +913,32 @@ async fn openai_chat(Json(input): Json<Value>) -> Response {
     })).into_response()
 }
 
-async fn openai_completion(Json(input): Json<Value>) -> Response {
-    let model = input["model"].as_str().unwrap_or(MODEL);
+async fn openai_completion(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+    let model = input["model"].as_str().unwrap_or(MODEL).to_string();
     let prompt = input["prompt"].as_str().unwrap_or("");
-    let payload = json!({"model": model, "prompt": prompt, "stream": false, "options": {
-        "temperature": input["temperature"].as_f64().unwrap_or(0.2),
-        "top_p": input["top_p"].as_f64().unwrap_or(0.8),
-        "top_k": input["top_k"].as_i64().unwrap_or(20),
-        "repeat_penalty": input["repeat_penalty"].as_f64().unwrap_or(1.05),
-        "num_predict": input["max_tokens"].as_i64().unwrap_or(1000)
-    }});
-    let response = match reqwest::Client::new().post(format!("{OLLAMA_URL}/api/generate")).json(&payload).send().await {
+    let ollama_url = {
+        let settings = state.settings.lock().await;
+        settings_string(&settings, "ollama_url", OLLAMA_URL)
+    };
+    let payload = json!({"model": model, "prompt": prompt, "stream": false, "options": build_chat_options(&input)});
+    let started = Instant::now();
+    let response = match reqwest::Client::new().post(format!("{ollama_url}/api/generate")).json(&payload).send().await {
         Ok(response) => response,
-        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error.to_string()).into_response(),
+        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error_chain(&error)).into_response(),
     };
     if !response.status().is_success() {
         return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
     }
     let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
+    let prompt_tokens = body["prompt_eval_count"].as_i64().unwrap_or(0);
+    let completion_tokens = body["eval_count"].as_i64().unwrap_or(0);
+    record_usage(&model, prompt_tokens, completion_tokens, started.elapsed().as_secs_f64(), "/v1/completions");
     Json(json!({
         "id": format!("cmpl-{}", chrono::Utc::now().timestamp_millis()),
         "object": "text_completion", "created": chrono::Utc::now().timestamp(),
         "model": model,
         "choices": [{"text": body["response"].as_str().unwrap_or(""), "index": 0, "finish_reason": "stop"}],
-        "usage": {"prompt_tokens": body["prompt_eval_count"].as_i64().unwrap_or(0), "completion_tokens": body["eval_count"].as_i64().unwrap_or(0)}
+        "usage": {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens, "total_tokens": prompt_tokens + completion_tokens}
     })).into_response()
 }
 
@@ -554,7 +957,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/", get(web_chat))
-        .route("/chat/new", get(web_chat))
+        .route("/chat/new", get(chat_new))
         .route("/chat/{id}", get(chat_by_id))
         .route("/login", get(login_get).post(login_post))
         .route("/logout", get(logout))
@@ -576,9 +979,11 @@ async fn main() {
         .route("/api/settings/test", post(test_settings))
         .route("/api/stats", get(stats))
         .route("/stats", get(stats))
+        .route("/stats/export", get(stats_export))
         .nest_service("/static", ServeDir::new("static"))
         .with_state(state)
-        .layer(TraceLayer::new_for_http());
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(auth_middleware));
     let address = SocketAddr::from(([127, 0, 0, 1], 8090));
 
     tracing::info!("Rust proxy listening on {}", address);
