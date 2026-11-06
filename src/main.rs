@@ -8,13 +8,16 @@ use axum::{
     Json, Router,
 };
 use axum_extra::extract::cookie::{Cookie, CookieJar};
-use futures_util::StreamExt;
+use futures_util::{stream::unfold, Stream, StreamExt};
 use rusqlite::{params, Connection};
-use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::io::Write;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
@@ -25,6 +28,63 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 const OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const MODEL: &str = "temper-2-ion";
 const DB_PATH: &str = "usage.db";
+
+fn default_model() -> String {
+    std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| MODEL.to_string())
+}
+
+fn default_ollama_url() -> String {
+    std::env::var("OLLAMA_URL")
+        .unwrap_or_else(|_| OLLAMA_URL.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn configured_model(settings: &Value) -> String {
+    settings["model"]
+        .as_str()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(default_model)
+}
+
+fn ollama_url(settings: &Value) -> String {
+    match settings["ollama_url"].as_str() {
+        Some(url) if !url.is_empty() => url.trim_end_matches('/').to_string(),
+        _ => default_ollama_url(),
+    }
+}
+
+fn default_settings() -> Value {
+    json!({
+        "ollama_url": default_ollama_url(),
+        "model": default_model(),
+        "temperature": 0.2,
+        "top_p": 0.8,
+        "top_k": 20,
+        "repeat_penalty": 1.05,
+        "max_tokens": 1000,
+        "num_ctx": 32768,
+        "input_price": 0.0001,
+        "output_price": 0.0002,
+        "usd_to_idr": 16000
+    })
+}
+
+fn load_settings() -> Value {
+    let mut settings = default_settings();
+    if let Some(object) = std::fs::read_to_string("settings.json")
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .and_then(|value| value.as_object().cloned())
+    {
+        for (key, value) in object {
+            settings[key] = value;
+        }
+    }
+    settings
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -53,21 +113,14 @@ impl SessionStats {
     }
 }
 
-#[derive(Serialize)]
-struct HealthResponse<'a> {
-    model: &'a str,
-    ollama: &'a str,
-    status: &'a str,
-    version: &'a str,
-}
-
-async fn health() -> Json<HealthResponse<'static>> {
-    Json(HealthResponse {
-        model: "temper-2-ion",
-        ollama: "http://127.0.0.1:11434",
-        status: "ok",
-        version: "2.0-rust",
-    })
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    let settings = state.settings.lock().await.clone();
+    Json(json!({
+        "status": "ok",
+        "model": configured_model(&settings),
+        "ollama": ollama_url(&settings),
+        "version": "2.0-rust",
+    }))
 }
 
 fn json_error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -97,7 +150,27 @@ fn init_db() -> rusqlite::Result<()> {
            prompt_tokens INTEGER, completion_tokens INTEGER,
            total_tokens INTEGER, elapsed_s REAL, endpoint TEXT
          );",
-    )
+    )?;
+    // The Python backend migrates older databases in place; mirror that so a
+    // shared usage.db keeps working if columns were added later.
+    let columns: Vec<String> = {
+        let mut statement = con.prepare("PRAGMA table_info(messages)")?;
+        let column_names = statement.query_map([], |row| row.get::<_, String>(1))?;
+        column_names.filter_map(Result::ok).collect()
+    };
+    if !columns.is_empty() {
+        for (column, ddl) in [
+            ("model", "ALTER TABLE messages ADD COLUMN model TEXT"),
+            ("elapsed_s", "ALTER TABLE messages ADD COLUMN elapsed_s REAL"),
+            ("branch_of", "ALTER TABLE messages ADD COLUMN branch_of INTEGER"),
+            ("branch_group", "ALTER TABLE messages ADD COLUMN branch_group INTEGER"),
+        ] {
+            if !columns.contains(&column.to_string()) {
+                con.execute(ddl, [])?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn now_unix() -> f64 {
@@ -122,7 +195,13 @@ fn record_usage(stats: &StdMutex<SessionStats>, model: &str, pt: i64, ct: i64, e
         session.prompt_tokens += pt;
         session.completion_tokens += ct;
         session.total_tokens += pt + ct;
+        while session.recent.len() >= 500 {
+            session.recent.remove(0);
+        }
         session.recent.push(record.clone());
+    }
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("usage.log") {
+        let _ = writeln!(file, "{}", record);
     }
     if let Ok(con) = Connection::open(DB_PATH) {
         con.execute(
@@ -182,11 +261,9 @@ fn bearer_or_header_ok(headers: &axum::http::HeaderMap, api_key: &str) -> bool {
 
 async fn auth_middleware(request: Request, next: Next) -> Response {
     let path = request.uri().path().to_string();
-    let skipped = path == "/health"
-        || path == "/login"
-        || path == "/logout"
-        || path == "/login?error=1"
-        || path.starts_with("/static/");
+    let skipped = ["/health", "/login", "/logout", "/static/"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(prefix));
     if skipped {
         return next.run(request).await;
     }
@@ -199,12 +276,39 @@ async fn auth_middleware(request: Request, next: Next) -> Response {
             value.split(';').any(|part| part.trim() == "rust_authed=1")
         })
         .unwrap_or(false);
-    let authed = cookie_ok || bearer_or_header_ok(request.headers(), &api_key);
-    if authed {
-        return next.run(request).await;
-    }
-    if path == "/" || path == "/settings" || path.starts_with("/chat") {
+    let bearer_ok = bearer_or_header_ok(request.headers(), &api_key);
+    let page_route = path == "/" || path == "/settings" || path.starts_with("/chat/");
+    if page_route {
+        if cookie_ok {
+            return next.run(request).await;
+        }
         return Redirect::to("/login").into_response();
+    }
+    let api_route = path.starts_with("/api/")
+        || path.starts_with("/v1/")
+        || path.starts_with("/models")
+        || path.starts_with("/stats");
+    if api_route {
+        if path.starts_with("/api/") {
+            if cookie_ok {
+                return next.run(request).await;
+            }
+            if bearer_ok {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(json!({"error": "unauth"})),
+                ).into_response();
+            }
+        } else if cookie_ok || bearer_ok {
+            return next.run(request).await;
+        }
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": {"message": "invalid api key", "type": "auth_error"}})),
+        ).into_response();
+    }
+    if bearer_ok {
+        return next.run(request).await;
     }
     (
         StatusCode::UNAUTHORIZED,
@@ -212,8 +316,9 @@ async fn auth_middleware(request: Request, next: Next) -> Response {
     ).into_response()
 }
 
-fn is_authed(jar: &CookieJar, headers: &axum::http::HeaderMap) -> bool {
-    jar.get("rust_authed").is_some() || bearer_or_header_ok(headers, &api_key_config())
+fn is_authed(jar: &CookieJar, _headers: &axum::http::HeaderMap) -> bool {
+    // Mirrors the Python session check used by the web UI handlers.
+    jar.get("rust_authed").is_some()
 }
 
 // ---- template render ----
@@ -248,6 +353,10 @@ async fn chat_new(
     render_chat(state, jar, headers, None, true).await
 }
 
+async fn web_settings() -> Redirect {
+    Redirect::to("/")
+}
+
 async fn render_chat(
     state: AppState,
     jar: CookieJar,
@@ -276,8 +385,8 @@ async fn render_chat(
     context.insert("messages", &messages);
     context.insert("messages_json", &serde_json::to_string(&messages).unwrap_or_else(|_| "[]".to_string()));
     let settings = state.settings.lock().await.clone();
-    context.insert("model_json", &serde_json::to_string(&settings["model"]).unwrap_or_else(|_| format!("\"{MODEL}\"")));
-    context.insert("ollama_json", &serde_json::to_string(&settings["ollama_url"]).unwrap_or_else(|_| format!("\"{OLLAMA_URL}\"")));
+    context.insert("model_json", &serde_json::to_string(&configured_model(&settings)).unwrap_or_else(|_| format!("\"{}\"", default_model())));
+    context.insert("ollama_json", &serde_json::to_string(&ollama_url(&settings)).unwrap_or_else(|_| format!("\"{}\"", default_ollama_url())));
     context.insert("conv_groups", &group_conversations(conversations));
     context.insert("settings", &settings);
     context.insert("V", "rust");
@@ -399,26 +508,26 @@ async fn logout(jar: CookieJar) -> (CookieJar, Redirect) {
 
 // ---- models (Ollama-backed, settings-aware) ----
 async fn models(State(state): State<AppState>) -> Json<Value> {
-    let ollama_url = {
+    let (fallback_model, ollama_url) = {
         let settings = state.settings.lock().await;
-        settings_string(&settings, "ollama_url", OLLAMA_URL)
+        (configured_model(&settings), ollama_url(&settings))
     };
-    let tags = match reqwest::get(format!("{ollama_url}/api/tags")).await {
-        Ok(response) => response.json::<Value>().await.unwrap_or_else(|_| json!({"models": []})),
-        Err(_) => json!({"models": []}),
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    let tags = match client.get(format!("{ollama_url}/api/tags")).send().await {
+        Ok(response) if response.status().is_success() => response.json::<Value>().await.unwrap_or_else(|_| json!({"models": []})),
+        _ => json!({"models": []}),
     };
     let empty_models = Vec::new();
     let data: Vec<Value> = tags["models"]
         .as_array()
         .unwrap_or(&empty_models)
         .iter()
-        .filter_map(|m| m["name"].as_str().map(|name| json!({"id": name, "object": "model", "owned_by": "ollama"})))
+        .map(|m| json!({"id": m["name"].as_str().unwrap_or(&fallback_model), "object": "model", "owned_by": "ollama"}))
         .collect();
-    Json(json!({"object": "list", "data": if data.is_empty() { vec![json!({"id": MODEL, "object": "model", "owned_by": "ollama"})] } else { data }}))
-}
-
-fn settings_string(settings: &Value, key: &str, fallback: &str) -> String {
-    settings[key].as_str().unwrap_or(fallback).to_string()
+    Json(json!({"object": "list", "data": if data.is_empty() { vec![json!({"id": fallback_model, "object": "model", "owned_by": "ollama"})] } else { data }}))
 }
 
 fn settings_number(settings: &Value, key: &str, fallback: f64) -> f64 {
@@ -426,23 +535,28 @@ fn settings_number(settings: &Value, key: &str, fallback: f64) -> f64 {
 }
 
 async fn running_model_names(ollama_url: &str) -> Vec<String> {
-    match reqwest::get(format!("{ollama_url}/api/ps")).await {
-        Ok(response) => response.json::<Value>().await.ok()
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    match client.get(format!("{ollama_url}/api/ps")).send().await {
+        Ok(response) if response.status().is_success() => response.json::<Value>().await.ok()
             .and_then(|value| value["models"].as_array().cloned())
             .unwrap_or_default()
             .iter()
             .filter_map(|model| model["name"].as_str().map(str::to_string))
             .collect(),
-        Err(_) => Vec::new(),
+        _ => Vec::new(),
     }
 }
 
 async fn model_status(State(state): State<AppState>) -> Json<Value> {
     let (configured, ollama_url) = {
         let settings = state.settings.lock().await;
-        (settings_string(&settings, "model", MODEL), settings_string(&settings, "ollama_url", OLLAMA_URL))
+        (configured_model(&settings), ollama_url(&settings))
     };
     let running = running_model_names(&ollama_url).await;
+    let configured = configured.trim().to_string();
     let base = configured.split(':').next().unwrap_or(&configured);
     let loaded = running.iter().any(|name| name == &configured || name.split(':').next() == Some(base));
     Json(json!({"model": configured, "loaded": loaded, "running": running}))
@@ -451,7 +565,7 @@ async fn model_status(State(state): State<AppState>) -> Json<Value> {
 async fn new_conversation(State(state): State<AppState>) -> Json<Value> {
     let model = {
         let settings = state.settings.lock().await;
-        settings_string(&settings, "model", MODEL)
+        configured_model(&settings)
     };
     let now = now_unix();
     let con = Connection::open(DB_PATH).expect("open database");
@@ -469,13 +583,13 @@ async fn delete_conversation(Path(id): Path<i64>) -> Json<Value> {
 
 #[derive(Deserialize)]
 struct RenameRequest {
-    title: String,
+    title: Option<String>,
 }
 
 async fn rename_conversation(Path(id): Path<i64>, Json(request): Json<RenameRequest>) -> Response {
-    let title = request.title.trim();
+    let title = request.title.as_deref().unwrap_or("").trim();
     if title.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "missing title").into_response();
+        return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
     }
     match Connection::open(DB_PATH).and_then(|con| {
         con.execute("UPDATE conversations SET title=? WHERE id=?",
@@ -546,16 +660,12 @@ fn active_chat_history(cid: i64) -> Value {
             Some(json!({"role": role, "content": content}))
         })
         .collect();
-    if history.is_empty() {
-        json!([{"role": "user", "content": ""}])
-    } else {
-        Value::Array(history)
-    }
+    Value::Array(history)
 }
 
 #[derive(Deserialize)]
 struct SendRequest {
-    conversation_id: i64,
+    conversation_id: Option<i64>,
     message: Option<String>,
     content: Option<String>,
     message_id: Option<i64>,
@@ -569,8 +679,55 @@ enum SseMode {
     OpenAI,
 }
 
-struct StreamState {
+fn persist_stream_finish(
+    stats: &Arc<StdMutex<SessionStats>>,
+    mode: SseMode,
+    model: &str,
+    full: &str,
+    pt: i64,
+    ct: i64,
+    eval_s: Option<f64>,
+    start: Instant,
+) {
+    let wall = start.elapsed().as_secs_f64();
+    let message_elapsed = eval_s.unwrap_or(wall);
+    match mode {
+        SseMode::Web { cid, endpoint } => {
+            add_message(cid, "assistant", full, pt, ct, Some(model), Some(message_elapsed), None, None);
+            record_usage(stats, model, pt, ct, wall, endpoint);
+            touch_conversation(cid);
+        }
+        SseMode::OpenAI => {
+            record_usage(stats, model, pt, ct, wall, "/v1/chat/completions");
+        }
+    }
+}
+
+fn sse_error_response(
+    stats: Arc<StdMutex<SessionStats>>,
+    model: String,
+    mode: SseMode,
+    message: String,
+    start: Instant,
+) -> Response {
+    persist_stream_finish(&stats, mode, &model, "", 0, 0, None, start);
+    let body = format!(
+        "data: {}\n\ndata: [DONE]\n\n",
+        json!({"error": message})
+    );
+    (
+        [(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))],
+        body,
+    ).into_response()
+}
+
+type ByteStream =
+    Pin<Box<dyn Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>;
+
+struct SseUnfoldState {
+    stream: ByteStream,
     buf: String,
+    output: VecDeque<String>,
     full: String,
     start: Instant,
     done: bool,
@@ -579,7 +736,140 @@ struct StreamState {
     eval_s: Option<f64>,
     model: String,
     mode: SseMode,
+    stats: Arc<StdMutex<SessionStats>>,
     persisted: bool,
+    done_sent: bool,
+    input_done: bool,
+}
+
+impl SseUnfoldState {
+    fn persist_once(&mut self) {
+        if self.persisted {
+            return;
+        }
+        self.persisted = true;
+        let model = self.model.clone();
+        let full = self.full.clone();
+        persist_stream_finish(
+            &self.stats,
+            self.mode,
+            &model,
+            &full,
+            self.pt,
+            self.ct,
+            self.eval_s,
+            self.start,
+        );
+    }
+
+    fn process_line(&mut self, line: String) {
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            return;
+        };
+        let delta = match value["message"]["content"].as_str() {
+            Some(content) => content,
+            None => "",
+        };
+        if let Some(count) = value["prompt_eval_count"].as_i64() {
+            self.pt = count;
+        }
+        if let Some(count) = value["eval_count"].as_i64() {
+            self.ct = count;
+        }
+        let is_done = value["done"].as_bool() == Some(true);
+        match self.mode {
+            SseMode::Web { .. } => {
+                if !delta.is_empty() {
+                    self.full.push_str(delta);
+                    self.output.push_back(format!(
+                        "data: {}\n\n",
+                        json!({
+                            "id": format!("c-{}", chrono::Utc::now().timestamp_millis()),
+                            "object": "chat.completion.chunk",
+                            "created": chrono::Utc::now().timestamp(),
+                            "model": self.model,
+                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
+                        })
+                    ));
+                }
+                if is_done && !self.done {
+                    self.done = true;
+                    self.eval_s = value["eval_duration"].as_f64().map(|d| d / 1e9);
+                    let elapsed = self
+                        .eval_s
+                        .unwrap_or_else(|| self.start.elapsed().as_secs_f64());
+                    self.output.push_back(format!(
+                        "data: {}\n\n",
+                        json!({
+                            "id": format!("c-{}", chrono::Utc::now().timestamp_millis()),
+                            "object": "chat.completion.chunk",
+                            "created": chrono::Utc::now().timestamp(),
+                            "model": self.model,
+                            "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                            "usage": {
+                                "prompt_tokens": self.pt,
+                                "completion_tokens": self.ct,
+                                "total_tokens": self.pt + self.ct,
+                                "model": self.model,
+                                "elapsed_s": (elapsed * 1000.0).round() / 1000.0
+                            }
+                        })
+                    ));
+                }
+            }
+            SseMode::OpenAI => {
+                if !delta.is_empty() {
+                    self.full.push_str(delta);
+                }
+                let mut chunk = json!({
+                    "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
+                    "object": "chat.completion.chunk",
+                    "created": chrono::Utc::now().timestamp(),
+                    "model": self.model,
+                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
+                });
+                if is_done && !self.done {
+                    self.done = true;
+                    chunk["choices"][0]["finish_reason"] = json!("stop");
+                    chunk["usage"] = json!({
+                        "prompt_tokens": self.pt,
+                        "completion_tokens": self.ct,
+                        "total_tokens": self.pt + self.ct
+                    });
+                }
+                self.output.push_back(format!("data: {}\n\n", chunk));
+            }
+        }
+        if is_done {
+            self.input_done = true;
+        }
+    }
+
+    fn process_bytes(&mut self, bytes: &[u8]) {
+        self.buf.push_str(&String::from_utf8_lossy(bytes));
+        while let Some(pos) = self.buf.find('\n') {
+            let line = self.buf[..pos].to_string();
+            self.buf.drain(..=pos);
+            self.process_line(line);
+            if self.input_done {
+                break;
+            }
+        }
+    }
+
+    fn finish_input(&mut self) {
+        if !self.input_done {
+            let line = std::mem::take(&mut self.buf);
+            if !line.trim().is_empty() {
+                self.process_line(line);
+            }
+            self.input_done = true;
+        }
+    }
 }
 
 fn sse_response(
@@ -589,218 +879,198 @@ fn sse_response(
     mode: SseMode,
 ) -> Response {
     let start = Instant::now();
-    let stream = response.bytes_stream().scan(
-        StreamState {
-            buf: String::new(),
-            full: String::new(),
-            start,
-            done: false,
-            pt: 0,
-            ct: 0,
-            eval_s: None,
-            model,
-            mode,
-            persisted: false,
-        },
-        move |state, chunk| {
-            let result = match chunk {
-                Ok(bytes) => {
-                    state.buf.push_str(&String::from_utf8_lossy(&bytes));
-                    let mut output = String::new();
-                    while let Some(pos) = state.buf.find('\n') {
-                        let line = state.buf[..pos].trim().to_string();
-                        state.buf.drain(..=pos);
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
-                        let delta = value["message"]["content"].as_str().unwrap_or("");
-                        if let Some(count) = value["prompt_eval_count"].as_i64() {
-                            state.pt = count;
-                        }
-                        if let Some(count) = value["eval_count"].as_i64() {
-                            state.ct = count;
-                        }
-                        let is_done = value["done"].as_bool() == Some(true);
-                        match state.mode {
-                            SseMode::Web { cid, endpoint } => {
-                                if !delta.is_empty() {
-                                    state.full.push_str(delta);
-                                    output.push_str(&format!("data: {}\n\n", json!({
-                                        "id": format!("c-{}", chrono::Utc::now().timestamp_millis()),
-                                        "object": "chat.completion.chunk",
-                                        "created": chrono::Utc::now().timestamp(),
-                                        "model": state.model,
-                                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
-                                    })));
-                                }
-                                if is_done && !state.done {
-                                    state.done = true;
-                                    state.eval_s = value["eval_duration"].as_f64().map(|d| d / 1e9);
-                                    let elapsed = state.eval_s.unwrap_or_else(|| state.start.elapsed().as_secs_f64());
-                                    let model = state.model.clone();
-                                    let full = state.full.clone();
-                                    add_message(cid, "assistant", &full, state.pt, state.ct, Some(&model), Some(elapsed), None, None);
-                                    record_usage(&stats, &model, state.pt, state.ct, elapsed, endpoint);
-                                    touch_conversation(cid);
-                                    state.persisted = true;
-                                    output.push_str(&format!("data: {}\n\n", json!({
-                                        "id": format!("c-{}", chrono::Utc::now().timestamp_millis()),
-                                        "object": "chat.completion.chunk",
-                                        "created": chrono::Utc::now().timestamp(),
-                                        "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                                        "usage": {
-                                            "prompt_tokens": state.pt,
-                                            "completion_tokens": state.ct,
-                                            "total_tokens": state.pt + state.ct,
-                                            "model": model,
-                                            "elapsed_s": (elapsed * 1000.0).round() / 1000.0
-                                        }
-                                    })));
-                                    output.push_str("data: [DONE]\n\n");
-                                }
-                            }
-                            SseMode::OpenAI => {
-                                if !delta.is_empty() {
-                                    state.full.push_str(delta);
-                                }
-                                let mut chunk = json!({
-                                    "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
-                                    "object": "chat.completion.chunk",
-                                    "created": chrono::Utc::now().timestamp(),
-                                    "model": state.model,
-                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
-                                });
-                                if is_done {
-                                    state.done = true;
-                                    let elapsed = value["eval_duration"].as_f64().map(|d| d / 1e9)
-                                        .unwrap_or_else(|| state.start.elapsed().as_secs_f64());
-                                    chunk["choices"][0]["finish_reason"] = json!("stop");
-                                    chunk["usage"] = json!({
-                                        "prompt_tokens": state.pt,
-                                        "completion_tokens": state.ct,
-                                        "total_tokens": state.pt + state.ct
-                                    });
-                                    let model = state.model.clone();
-                                    record_usage(&stats, &model, state.pt, state.ct, elapsed, "/v1/chat/completions");
-                                    state.persisted = true;
-                                    output.push_str(&format!("data: {}\n\n", chunk));
-                                    output.push_str("data: [DONE]\n\n");
-                                } else {
-                                    output.push_str(&format!("data: {}\n\n", chunk));
-                                }
-                            }
-                        }
-                    }
-                    Ok::<_, std::io::Error>(output)
+    let byte_stream = response
+        .bytes_stream()
+        .map(|result| result.map(|bytes| bytes.to_vec()))
+        .boxed();
+    let initial_state = SseUnfoldState {
+        stream: byte_stream,
+        buf: String::new(),
+        output: VecDeque::new(),
+        full: String::new(),
+        start,
+        done: false,
+        pt: 0,
+        ct: 0,
+        eval_s: None,
+        model,
+        mode,
+        stats,
+        persisted: false,
+        done_sent: false,
+        input_done: false,
+    };
+    let stream = unfold(initial_state, |mut state| async move {
+        if state.output.is_empty() {
+            if state.input_done {
+                if !state.done_sent {
+                    state.persist_once();
+                    state.done_sent = true;
+                    state.output.push_back("data: [DONE]\n\n".to_string());
+                } else {
+                    return None;
                 }
-                Err(error) => {
-                    // Mirror the Python finally-block: persist whatever streamed
-                    // before the failure, once.
-                    if !state.persisted {
-                        let elapsed = state.start.elapsed().as_secs_f64();
-                        let model = state.model.clone();
-                        match state.mode {
-                            SseMode::Web { cid, endpoint } => {
-                                let full = state.full.clone();
-                                add_message(cid, "assistant", &full, state.pt, state.ct, Some(&model), Some(elapsed), None, None);
-                                record_usage(&stats, &model, state.pt, state.ct, elapsed, endpoint);
-                                touch_conversation(cid);
-                            }
-                            SseMode::OpenAI => {
-                                record_usage(&stats, &model, state.pt, state.ct, elapsed, "/v1/chat/completions");
-                            }
-                        }
-                        state.persisted = true;
+            } else {
+                match state.stream.next().await {
+                    Some(Ok(bytes)) => state.process_bytes(&bytes),
+                    Some(Err(error)) => {
+                        state.output.push_back(format!(
+                            "data: {}\n\n",
+                            json!({"error": error_chain(&error)})
+                        ));
+                        state.input_done = true;
                     }
-                    state.done = true;
-                    let message = error_chain(&error);
-                    Ok::<_, std::io::Error>(format!("data: {}\n\n", json!({"error": message})))
+                    None => state.finish_input(),
                 }
-            };
-            futures_util::future::ready(Some(result))
-        },
-    );
+                if state.output.is_empty() {
+                    // A chunk with no output means the generator should continue
+                    // pulling from Ollama rather than returning an empty frame.
+                    return Some((Ok::<_, std::io::Error>(String::new()), state));
+                }
+            }
+        }
+        match state.output.pop_front() {
+            Some(item) => Some((Ok::<_, std::io::Error>(item), state)),
+            None => None,
+        }
+    });
     (
         [(header::CONTENT_TYPE, HeaderValue::from_static("text/event-stream"))],
         Body::from_stream(stream),
     ).into_response()
 }
 
-async fn stream_chat(State(state): State<AppState>, Json(request): Json<SendRequest>) -> Response {
-    let content = request.content.clone()
-        .or_else(|| request.message.clone())
-        .map(|c| c.trim().to_string())
-        .unwrap_or_default();
-    if content.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "missing message").into_response();
-    }
-    let cid = request.conversation_id;
-    let settings = state.settings.lock().await.clone();
-    let model = settings_string(&settings, "model", MODEL);
-    let ollama_url = settings_string(&settings, "ollama_url", OLLAMA_URL);
+async fn send_stream_chat(
+    State(state): State<AppState>,
+    Json(request): Json<SendRequest>,
+) -> Response {
+    stream_chat_mode(state, request, false).await
+}
 
-    // Edit path: keep the original as an older version (branch) and remove the
-    // old response branch, mirroring the Python backend.
-    let mut message_id: Option<i64> = None;
-    if let Some(mid) = request.message_id {
+async fn edit_stream_chat(
+    State(state): State<AppState>,
+    Json(request): Json<SendRequest>,
+) -> Response {
+    stream_chat_mode(state, request, true).await
+}
+
+async fn stream_chat_mode(state: AppState, request: SendRequest, is_edit: bool) -> Response {
+    let content = request
+        .content
+        .clone()
+        .or_else(|| request.message.clone())
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    if content.is_empty() && !request.skip_add_user {
+        return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
+    }
+    let settings = state.settings.lock().await.clone();
+    let model = configured_model(&settings);
+    let ollama_url = ollama_url(&settings);
+    let mut cid = request.conversation_id;
+    let endpoint;
+
+    if is_edit {
         let con = match Connection::open(DB_PATH) {
             Ok(con) => con,
             Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
         };
-        let orig = con.query_row(
-            "SELECT role, branch_of, branch_group FROM messages WHERE id=? AND conversation_id=?",
-            params![mid, cid],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?, row.get::<_, Option<i64>>(2)?)),
+        let mid = match request.message_id {
+            Some(mid) => Some(mid),
+            None => {
+                let Some(cid_request) = cid else {
+                    return json_error(StatusCode::BAD_REQUEST, "missing message_id").into_response();
+                };
+                con.query_row(
+                    "SELECT id FROM messages WHERE conversation_id=? AND role='user' ORDER BY id DESC LIMIT 1",
+                    params![cid_request],
+                    |row| row.get::<_, i64>(0),
+                )
+                .ok()
+            }
+        };
+        let Some(mid) = mid else {
+            return json_error(StatusCode::BAD_REQUEST, "missing message_id").into_response();
+        };
+        let original = con.query_row(
+            "SELECT role, conversation_id, branch_of, branch_group FROM messages WHERE id=?",
+            params![mid],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                ))
+            },
         );
-        match orig {
-            Ok((role, orig_branch_of, orig_branch_group)) => {
+        match original {
+            Err(_) => return json_error(StatusCode::NOT_FOUND, "not found").into_response(),
+            Ok((role, row_cid, branch_of, branch_group)) => {
                 if role != "user" {
                     return json_error(StatusCode::BAD_REQUEST, "can only edit user messages").into_response();
                 }
-                message_id = Some(mid);
-                if request.message_id.is_some() {
-                    con.execute("DELETE FROM messages WHERE conversation_id=? AND id>?", params![cid, mid]).ok();
-                }
-                if !request.skip_add_user {
-                    let branch_of = orig_branch_of.unwrap_or(mid);
-                    let branch_group = orig_branch_group.unwrap_or(mid);
-                    add_message(cid, "user", &content, 0, 0, None, None, Some(branch_of), Some(branch_group));
-                    con.execute("UPDATE conversations SET title=? WHERE id=?", params![truncate_chars(&content, 40), cid]).ok();
+                cid = Some(row_cid);
+                con.execute("DELETE FROM messages WHERE conversation_id=? AND id>?", params![row_cid, mid]).ok();
+                let branch_of = branch_of.unwrap_or(mid);
+                let branch_group = branch_group.unwrap_or(mid);
+                drop(con);
+                add_message(row_cid, "user", &content, 0, 0, None, None, Some(branch_of), Some(branch_group));
+                if let Ok(con) = Connection::open(DB_PATH) {
+                    con.execute(
+                        "UPDATE conversations SET title=? WHERE id=?",
+                        params![truncate_chars(&content, 40), row_cid],
+                    ).ok();
                 }
             }
-            Err(_) => return json_error(StatusCode::NOT_FOUND, "not found").into_response(),
         }
-    }
-    if message_id.is_none() && !request.skip_add_user {
-        add_message(cid, "user", &content, 0, 0, None, None, None, None);
-        let con = Connection::open(DB_PATH).expect("open database");
-        con.execute(
-            "UPDATE conversations SET title=? WHERE id=? AND (title IS NULL OR title='')",
-            params![truncate_chars(&content, 40), cid],
-        ).ok();
-    }
-
-    let endpoint: &'static str = if request.message_id.is_some() {
-        if request.skip_add_user { "/web/regenerate" } else { "/web/edit" }
+        endpoint = "/web/edit";
     } else if request.skip_add_user {
-        "/web/regenerate"
+        if cid.is_none() {
+            return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
+        }
+        endpoint = "/web/regenerate";
     } else {
-        "/web/chat"
-    };
+        let Some(cid_value) = cid else {
+            return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
+        };
+        add_message(cid_value, "user", &content, 0, 0, None, None, None, None);
+        if let Ok(con) = Connection::open(DB_PATH) {
+            con.execute(
+                "UPDATE conversations SET title=? WHERE id=? AND (title IS NULL OR title='')",
+                params![truncate_chars(&content, 40), cid_value],
+            ).ok();
+        }
+        endpoint = "/web/chat";
+    }
 
+    let Some(cid) = cid else {
+        return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
+    };
+    let started = Instant::now();
     let payload = json!({
         "model": model,
         "messages": active_chat_history(cid),
         "stream": true,
         "options": chat_options(&settings)
     });
-    let response = match reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
         .timeout(Duration::from_secs(300))
         .build()
-        .expect("build ollama client")
+    {
+        Ok(client) => client,
+        Err(error) => {
+            return sse_error_response(
+                state.stats.clone(),
+                model,
+                SseMode::Web { cid, endpoint },
+                error_chain(&error),
+                started,
+            )
+        }
+    };
+    let response = match client
         .post(format!("{ollama_url}/api/chat"))
         .json(&payload)
         .send()
@@ -810,25 +1080,46 @@ async fn stream_chat(State(state): State<AppState>, Json(request): Json<SendRequ
         Err(error) => {
             let chain = error_chain(&error);
             tracing::error!("ollama chat failed: {chain}");
-            return json_error(StatusCode::BAD_GATEWAY, &chain).into_response();
-        },
+            return sse_error_response(
+                state.stats.clone(),
+                model,
+                SseMode::Web { cid, endpoint },
+                chain,
+                started,
+            );
+        }
     };
     if !response.status().is_success() {
-        return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
+        return sse_error_response(
+            state.stats.clone(),
+            model,
+            SseMode::Web { cid, endpoint },
+            format!("Ollama returned {}", response.status()),
+            started,
+        );
     }
     sse_response(state.stats.clone(), response, model, SseMode::Web { cid, endpoint })
 }
 
 async fn regenerate(State(state): State<AppState>, Json(request): Json<SendRequest>) -> Response {
+    let Some(cid) = request.conversation_id else {
+        return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
+    };
     let con = match Connection::open(DB_PATH) {
         Ok(con) => con,
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
     };
+    let exists: Option<i64> = con
+        .query_row("SELECT id FROM conversations WHERE id=?", params![cid], |row| row.get(0))
+        .ok();
+    if exists.is_none() {
+        return json_error(StatusCode::NOT_FOUND, "not found").into_response();
+    }
     // Python checks only the last message: drop it when it is an assistant
     // reply, otherwise leave the conversation untouched.
     let last: Option<(i64, String)> = con.query_row(
         "SELECT id, role FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1",
-        params![request.conversation_id],
+        params![cid],
         |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
     ).ok();
     match last {
@@ -840,19 +1131,21 @@ async fn regenerate(State(state): State<AppState>, Json(request): Json<SendReque
         }
     }
     drop(con);
-    let history = list_messages(request.conversation_id);
+    let history = list_messages(cid);
     let last_user = history.iter().rev().find(|message| message["role"] == "user");
     let content = last_user.and_then(|message| message["content"].as_str()).unwrap_or("").to_string();
-    stream_chat(
-        State(state),
-        Json(SendRequest {
-            conversation_id: request.conversation_id,
+    stream_chat_mode(
+        state,
+        SendRequest {
+            conversation_id: Some(cid),
             message: None,
             content: Some(content),
             message_id: None,
             skip_add_user: true,
-        }),
-    ).await
+        },
+        false,
+    )
+    .await
 }
 
 // ---- model load/unload (checks Ollama state first, like the Python version) ----
@@ -864,8 +1157,8 @@ struct ModelRequest {
 async fn model_load(State(state): State<AppState>, Json(request): Json<ModelRequest>) -> Response {
     let (want, ollama_url) = {
         let settings = state.settings.lock().await;
-        (request.model.clone().unwrap_or_else(|| settings_string(&settings, "model", MODEL)),
-         settings_string(&settings, "ollama_url", OLLAMA_URL))
+        let raw = request.model.clone().filter(|model| !model.is_empty()).unwrap_or_else(|| configured_model(&settings));
+        (raw.trim().to_string(), ollama_url(&settings))
     };
     let loaded = running_model_names(&ollama_url).await.iter().any(|name| {
         let base = want.split(':').next().unwrap_or(&want);
@@ -890,8 +1183,8 @@ async fn model_load(State(state): State<AppState>, Json(request): Json<ModelRequ
 async fn model_unload(State(state): State<AppState>, Json(request): Json<ModelRequest>) -> Response {
     let (model, ollama_url) = {
         let settings = state.settings.lock().await;
-        (request.model.clone().unwrap_or_else(|| settings_string(&settings, "model", MODEL)),
-         settings_string(&settings, "ollama_url", OLLAMA_URL))
+        (request.model.clone().filter(|model| !model.is_empty()).unwrap_or_else(|| configured_model(&settings)),
+         ollama_url(&settings))
     };
     match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -925,10 +1218,18 @@ async fn save_settings(State(state): State<AppState>, Json(input): Json<Value>) 
 async fn test_settings(State(state): State<AppState>, Json(input): Json<Value>) -> Json<Value> {
     let fallback = {
         let settings = state.settings.lock().await;
-        settings_string(&settings, "ollama_url", OLLAMA_URL)
+        ollama_url(&settings)
     };
-    let url = input["ollama_url"].as_str().unwrap_or(&fallback).trim_end_matches('/');
-    match reqwest::get(format!("{url}/api/tags")).await {
+    let url = input["ollama_url"]
+        .as_str()
+        .filter(|url| !url.is_empty())
+        .unwrap_or(&fallback)
+        .trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
+    match client.get(format!("{url}/api/tags")).send().await {
         Ok(response) if response.status().is_success() => {
             let count = response.json::<Value>().await.ok()
                 .and_then(|value| value["models"].as_array().map(Vec::len)).unwrap_or(0);
@@ -942,6 +1243,10 @@ async fn test_settings(State(state): State<AppState>, Json(input): Json<Value>) 
 // ---- stats: totals + recent requests, and CSV export ----
 async fn stats(State(state): State<AppState>) -> Response {
     let zero = json!({"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+    let (session, recent) = match state.stats.lock() {
+        Ok(session) => (session.snapshot(), session.recent.clone()),
+        Err(_) => (zero.clone(), Vec::new()),
+    };
     let totals = Connection::open(DB_PATH).ok().and_then(|con| {
         con.query_row(
             "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0) FROM usage",
@@ -952,11 +1257,7 @@ async fn stats(State(state): State<AppState>) -> Response {
                 "total_tokens": row.get::<_, i64>(3)?
             }))
         ).ok()
-    }).unwrap_or_else(|| zero.clone());
-    let (session, recent) = match state.stats.lock() {
-        Ok(session) => (session.snapshot(), session.recent.clone()),
-        Err(_) => (zero.clone(), Vec::new()),
-    };
+    }).unwrap_or_else(|| session.clone());
     Json(json!({"totals": totals, "recent": recent, "session": session})).into_response()
 }
 
@@ -967,22 +1268,16 @@ async fn stats_export() -> Response {
             "SELECT ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint FROM usage ORDER BY id"
         ) {
             let rows: Vec<String> = statement.query_map([], |row| {
-                let ts: f64 = row.get(0)?;
-                let model: Option<String> = row.get(1)?;
-                let pt: i64 = row.get(2)?;
-                let ct: i64 = row.get(3)?;
-                let tt: i64 = row.get(4)?;
-                let elapsed: Option<f64> = row.get(5)?;
-                let endpoint: Option<String> = row.get(6)?;
-                Ok(vec![
-                    format!("{ts}"),
-                    model.unwrap_or_default(),
-                    format!("{pt}"),
-                    format!("{ct}"),
-                    format!("{tt}"),
-                    elapsed.map(|e| format!("{e}")).unwrap_or_default(),
-                    endpoint.unwrap_or_default(),
-                ].join(","))
+                Ok((0..7).map(|index| {
+                    let value: rusqlite::types::Value = row.get(index).unwrap_or(rusqlite::types::Value::Null);
+                    match value {
+                        rusqlite::types::Value::Null => "None".to_string(),
+                        rusqlite::types::Value::Integer(value) => value.to_string(),
+                        rusqlite::types::Value::Real(value) => format!("{:?}", value),
+                        rusqlite::types::Value::Text(value) => value,
+                        rusqlite::types::Value::Blob(value) => format!("{:?}", String::from_utf8_lossy(&value)),
+                    }
+                }).collect::<Vec<String>>().join(","))
             }).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default();
             for row in rows {
                 body.push_str(&row);
@@ -1000,36 +1295,69 @@ async fn stats_export() -> Response {
 }
 
 // ---- OpenAI-compatible API ----
+fn json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64().map(|number| number != 0.0).unwrap_or(true),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(value) => !value.is_empty(),
+        Value::Object(value) => !value.is_empty(),
+    }
+}
+
 fn build_chat_options(input: &Value) -> Value {
-    json!({
-        "temperature": input["temperature"].as_f64().unwrap_or(0.2),
-        "top_p": input["top_p"].as_f64().unwrap_or(0.8),
-        "top_k": input["top_k"].as_i64().unwrap_or(20),
-        "repeat_penalty": input["repeat_penalty"].as_f64().unwrap_or(1.05),
-        "num_predict": input["max_tokens"].as_i64().unwrap_or(1000)
-    })
+    let mut options = serde_json::Map::with_capacity(6);
+    options.insert("temperature".to_string(), input.get("temperature").cloned().unwrap_or_else(|| json!(0.2)));
+    options.insert("top_p".to_string(), input.get("top_p").cloned().unwrap_or_else(|| json!(0.8)));
+    options.insert("top_k".to_string(), input.get("top_k").cloned().unwrap_or_else(|| json!(20)));
+    options.insert("repeat_penalty".to_string(), input.get("repeat_penalty").cloned().unwrap_or_else(|| json!(1.05)));
+    options.insert("num_predict".to_string(), input.get("max_tokens").cloned().unwrap_or_else(|| json!(1000)));
+    if let Some(num_ctx) = input.get("num_ctx") {
+        if json_truthy(num_ctx) {
+            options.insert("num_ctx".to_string(), num_ctx.clone());
+        }
+    }
+    Value::Object(options)
 }
 
 async fn openai_chat(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
-    let model = input["model"].as_str().unwrap_or(MODEL).to_string();
-    let messages = input["messages"].as_array().cloned().unwrap_or_default();
-    let ollama_url = {
+    let (model, ollama_url) = {
         let settings = state.settings.lock().await;
-        settings_string(&settings, "ollama_url", OLLAMA_URL)
+        (
+            input["model"].as_str().map(str::to_string).unwrap_or_else(|| configured_model(&settings)),
+            ollama_url(&settings),
+        )
     };
-    let wants_stream = input["stream"].as_bool().unwrap_or(false);
+    let messages = input["messages"].as_array().cloned().unwrap_or_default();
+    let wants_stream = input.get("stream").map(json_truthy).unwrap_or(false);
     let payload = if wants_stream {
         json!({"model": model, "messages": messages, "stream": true, "options": build_chat_options(&input)})
     } else {
         json!({"model": model, "messages": messages, "stream": false, "options": build_chat_options(&input)})
     };
     if wants_stream {
+        let started = Instant::now();
         let response = match reqwest::Client::new().post(format!("{ollama_url}/api/chat")).json(&payload).send().await {
             Ok(response) => response,
-            Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error_chain(&error)).into_response(),
+            Err(error) => {
+                return sse_error_response(
+                    state.stats.clone(),
+                    model,
+                    SseMode::OpenAI,
+                    error_chain(&error),
+                    started,
+                )
+            }
         };
         if !response.status().is_success() {
-            return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
+            return sse_error_response(
+                state.stats.clone(),
+                model,
+                SseMode::OpenAI,
+                format!("Ollama returned {}", response.status()),
+                started,
+            );
         }
         return sse_response(state.stats.clone(), response, model, SseMode::OpenAI);
     }
@@ -1057,12 +1385,14 @@ async fn openai_chat(State(state): State<AppState>, Json(input): Json<Value>) ->
 }
 
 async fn openai_completion(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
-    let model = input["model"].as_str().unwrap_or(MODEL).to_string();
-    let prompt = input["prompt"].as_str().unwrap_or("");
-    let ollama_url = {
+    let (model, ollama_url) = {
         let settings = state.settings.lock().await;
-        settings_string(&settings, "ollama_url", OLLAMA_URL)
+        (
+            input["model"].as_str().map(str::to_string).unwrap_or_else(|| configured_model(&settings)),
+            ollama_url(&settings),
+        )
     };
+    let prompt = input["prompt"].as_str().unwrap_or("");
     let payload = json!({"model": model, "prompt": prompt, "stream": false, "options": build_chat_options(&input)});
     let started = Instant::now();
     let response = match reqwest::Client::new().post(format!("{ollama_url}/api/generate")).json(&payload).send().await {
@@ -1091,10 +1421,7 @@ async fn main() {
     init_db().expect("failed to initialize SQLite database");
     let mut templates = Tera::new("templates/**/*").expect("failed to load templates");
     templates.autoescape_on(vec!["html"]);
-    let settings = std::fs::read_to_string("settings.json")
-        .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())
-        .unwrap_or_else(|| json!({"model": MODEL, "ollama_url": OLLAMA_URL}));
+    let settings = load_settings();
     let state = AppState {
         templates: Arc::new(templates),
         settings: Arc::new(Mutex::new(settings)),
@@ -1104,6 +1431,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/", get(web_chat))
+        .route("/settings", get(web_settings))
         .route("/chat/new", get(chat_new))
         .route("/chat/{id}", get(chat_by_id))
         .route("/login", get(login_get).post(login_post))
@@ -1119,8 +1447,8 @@ async fn main() {
         .route("/api/conversations/new", post(new_conversation))
         .route("/api/conversations/{id}", delete(delete_conversation))
         .route("/api/conversations/{id}/rename", post(rename_conversation))
-        .route("/api/chat/send", post(stream_chat))
-        .route("/api/chat/edit", post(stream_chat))
+        .route("/api/chat/send", post(send_stream_chat))
+        .route("/api/chat/edit", post(edit_stream_chat))
         .route("/api/chat/regenerate", post(regenerate))
         .route("/api/settings", post(save_settings))
         .route("/api/settings/test", post(test_settings))
