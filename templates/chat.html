@@ -34,10 +34,10 @@ window.TEMPER = {
       </div>
     </div>
     <div class="conv-scroll" id="convList">
-      {% for group, items in conv_groups %}
-      <div class="conv-group">{{ group }}</div>
-      <div data-group="{{ group }}">
-        {% for c in items %}
+      {% for g in conv_groups %}
+      <div class="conv-group">{{ g.name }}</div>
+      <div data-group="{{ g.name }}">
+        {% for c in g.items %}
         <a class="conv-item {% if c.id==active_id %}active{% endif %}" href="/chat/{{ c.id }}" data-id="{{ c.id }}">
           <span class="conv-title">{{ c["title"] | default(value="Untitled") }}</span>
           <button class="conv-menu-btn" type="button" aria-label="Menu">

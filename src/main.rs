@@ -12,7 +12,12 @@ use futures_util::StreamExt;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::{Duration, Instant}};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex as StdMutex},
+    time::{Duration, Instant},
+};
 use tera::{Context, Tera};
 use tokio::sync::Mutex;
 use tower_http::{services::ServeDir, trace::TraceLayer};
@@ -25,6 +30,27 @@ const DB_PATH: &str = "usage.db";
 struct AppState {
     templates: Arc<Tera>,
     settings: Arc<Mutex<Value>>,
+    stats: Arc<StdMutex<SessionStats>>,
+}
+
+#[derive(Default)]
+struct SessionStats {
+    requests: i64,
+    prompt_tokens: i64,
+    completion_tokens: i64,
+    total_tokens: i64,
+    recent: Vec<Value>,
+}
+
+impl SessionStats {
+    fn snapshot(&self) -> Value {
+        json!({
+            "requests": self.requests,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+        })
+    }
 }
 
 #[derive(Serialize)]
@@ -46,6 +72,11 @@ async fn health() -> Json<HealthResponse<'static>> {
 
 fn json_error(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
     (status, Json(json!({"error": message})))
+}
+
+// OpenAI-compatible upstream failure shape, matching the Python backend.
+fn upstream_error(message: &str) -> (StatusCode, Json<Value>) {
+    (StatusCode::BAD_GATEWAY, Json(json!({"error": {"message": message, "type": "upstream_error"}})))
 }
 
 fn init_db() -> rusqlite::Result<()> {
@@ -77,11 +108,34 @@ fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
-fn record_usage(model: &str, pt: i64, ct: i64, elapsed: f64, endpoint: &str) {
+fn record_usage(stats: &StdMutex<SessionStats>, model: &str, pt: i64, ct: i64, elapsed: f64, endpoint: &str) {
+    let record = json!({
+        "ts": now_unix(),
+        "model": model,
+        "prompt_tokens": pt,
+        "completion_tokens": ct,
+        "total_tokens": pt + ct,
+        "elapsed_s": (elapsed * 1000.0).round() / 1000.0,
+    });
+    if let Ok(mut session) = stats.lock() {
+        session.requests += 1;
+        session.prompt_tokens += pt;
+        session.completion_tokens += ct;
+        session.total_tokens += pt + ct;
+        session.recent.push(record.clone());
+    }
     if let Ok(con) = Connection::open(DB_PATH) {
         con.execute(
             "INSERT INTO usage (ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint) VALUES (?,?,?,?,?,?,?)",
-            params![now_unix(), model, pt, ct, pt + ct, elapsed, endpoint],
+            params![
+                record["ts"].as_f64().unwrap_or_else(now_unix),
+                model,
+                pt,
+                ct,
+                pt + ct,
+                record["elapsed_s"].as_f64().unwrap_or(elapsed),
+                endpoint
+            ],
         ).ok();
     }
 }
@@ -224,7 +278,7 @@ async fn render_chat(
     let settings = state.settings.lock().await.clone();
     context.insert("model_json", &serde_json::to_string(&settings["model"]).unwrap_or_else(|_| format!("\"{MODEL}\"")));
     context.insert("ollama_json", &serde_json::to_string(&settings["ollama_url"]).unwrap_or_else(|_| format!("\"{OLLAMA_URL}\"")));
-    context.insert("conv_groups", &json!({"Today": conversations}));
+    context.insert("conv_groups", &group_conversations(conversations));
     context.insert("settings", &settings);
     context.insert("V", "rust");
     match state.templates.render("chat.html", &context) {
@@ -244,12 +298,43 @@ fn list_conversations() -> Vec<Value> {
     statement.query_map([], |row| {
         Ok(json!({
             "id": row.get::<_, i64>(0)?,
-            "title": row.get::<_, Option<String>>(1)?.unwrap_or_else(|| "New chat".to_string()),
+            "title": row.get::<_, Option<String>>(1)?.unwrap_or_else(|| "Untitled".to_string()),
             "model": row.get::<_, Option<String>>(2)?,
             "created_at": row.get::<_, f64>(3)?,
             "updated_at": row.get::<_, f64>(4)?
         }))
     }).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
+}
+
+// Mirrors the Python _group_conversations: Today / Previous 7 days / Older,
+// dropping empty groups. Rendered by chat.html as an ordered list of groups.
+fn group_conversations(conversations: Vec<Value>) -> Value {
+    let now = chrono::Local::now().date_naive();
+    let week_ago = now - chrono::Duration::days(7);
+    let mut today = Vec::new();
+    let mut week = Vec::new();
+    let mut older = Vec::new();
+    for conversation in conversations {
+        let stamp = conversation["updated_at"].as_f64().unwrap_or(0.0);
+        let date = chrono::DateTime::from_timestamp(stamp as i64, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).date_naive());
+        match date {
+            Some(date) if date >= now => today.push(conversation),
+            Some(date) if date >= week_ago => week.push(conversation),
+            _ => older.push(conversation),
+        }
+    }
+    let mut groups = Vec::new();
+    if !today.is_empty() {
+        groups.push(json!({"name": "Today", "items": today}));
+    }
+    if !week.is_empty() {
+        groups.push(json!({"name": "Previous 7 days", "items": week}));
+    }
+    if !older.is_empty() {
+        groups.push(json!({"name": "Older", "items": older}));
+    }
+    Value::Array(groups)
 }
 
 fn list_messages(cid: i64) -> Vec<Value> {
@@ -274,8 +359,13 @@ fn list_messages(cid: i64) -> Vec<Value> {
     }).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
 }
 
-async fn login_get(State(state): State<AppState>) -> Response {
-    match state.templates.render("login.html", &Context::new()) {
+async fn login_get(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if jar.get("rust_authed").is_some() {
+        return Redirect::to("/").into_response();
+    }
+    let mut context = Context::new();
+    context.insert("error", &Value::Null);
+    match state.templates.render("login.html", &context) {
         Ok(body) => Html(body).into_response(),
         Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
     }
@@ -286,11 +376,21 @@ struct LoginForm {
     password: String,
 }
 
-async fn login_post(jar: CookieJar, axum::Form(form): axum::Form<LoginForm>) -> (CookieJar, Redirect) {
+async fn login_post(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    axum::Form(form): axum::Form<LoginForm>,
+) -> Response {
     if form.password == web_password() {
-        return (jar.add(Cookie::new("rust_authed", "1")), Redirect::to("/"));
+        return (jar.add(Cookie::new("rust_authed", "1")), Redirect::to("/")).into_response();
     }
-    (jar, Redirect::to("/login"))
+    // Same as the Python backend: re-render the login page with an error, 401.
+    let mut context = Context::new();
+    context.insert("error", &"Invalid password");
+    match state.templates.render("login.html", &context) {
+        Ok(body) => (StatusCode::UNAUTHORIZED, Html(body)).into_response(),
+        Err(_) => Redirect::to("/login").into_response(),
+    }
 }
 
 async fn logout(jar: CookieJar) -> (CookieJar, Redirect) {
@@ -479,9 +579,15 @@ struct StreamState {
     eval_s: Option<f64>,
     model: String,
     mode: SseMode,
+    persisted: bool,
 }
 
-fn sse_response(response: reqwest::Response, model: String, mode: SseMode) -> Response {
+fn sse_response(
+    stats: Arc<StdMutex<SessionStats>>,
+    response: reqwest::Response,
+    model: String,
+    mode: SseMode,
+) -> Response {
     let start = Instant::now();
     let stream = response.bytes_stream().scan(
         StreamState {
@@ -494,6 +600,7 @@ fn sse_response(response: reqwest::Response, model: String, mode: SseMode) -> Re
             eval_s: None,
             model,
             mode,
+            persisted: false,
         },
         move |state, chunk| {
             let result = match chunk {
@@ -503,34 +610,40 @@ fn sse_response(response: reqwest::Response, model: String, mode: SseMode) -> Re
                     while let Some(pos) = state.buf.find('\n') {
                         let line = state.buf[..pos].trim().to_string();
                         state.buf.drain(..=pos);
-                        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
-                        if let Some(delta) = value["message"]["content"].as_str().filter(|c| !c.is_empty()) {
-                            state.full.push_str(delta);
-                            let chunk_id = match state.mode {
-                                SseMode::Web { .. } => format!("c-{}", chrono::Utc::now().timestamp_millis()),
-                                SseMode::OpenAI => format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
-                            };
-                            output.push_str(&format!("data: {}\n\n", json!({
-                                "id": chunk_id,
-                                "object": "chat.completion.chunk",
-                                "created": chrono::Utc::now().timestamp(),
-                                "model": state.model,
-                                "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
-                            })));
+                        if line.is_empty() {
+                            continue;
                         }
-                        if value["done"].as_bool() == Some(true) && !state.done {
-                            state.done = true;
-                            state.pt = value["prompt_eval_count"].as_i64().unwrap_or(0);
-                            state.ct = value["eval_count"].as_i64().unwrap_or(0);
-                            state.eval_s = value["eval_duration"].as_f64().map(|d| d / 1e9);
-                            let elapsed = state.eval_s.unwrap_or_else(|| state.start.elapsed().as_secs_f64());
-                            let model = state.model.clone();
-                            match state.mode {
-                                SseMode::Web { cid, endpoint } => {
+                        let Ok(value) = serde_json::from_str::<Value>(&line) else { continue };
+                        let delta = value["message"]["content"].as_str().unwrap_or("");
+                        if let Some(count) = value["prompt_eval_count"].as_i64() {
+                            state.pt = count;
+                        }
+                        if let Some(count) = value["eval_count"].as_i64() {
+                            state.ct = count;
+                        }
+                        let is_done = value["done"].as_bool() == Some(true);
+                        match state.mode {
+                            SseMode::Web { cid, endpoint } => {
+                                if !delta.is_empty() {
+                                    state.full.push_str(delta);
+                                    output.push_str(&format!("data: {}\n\n", json!({
+                                        "id": format!("c-{}", chrono::Utc::now().timestamp_millis()),
+                                        "object": "chat.completion.chunk",
+                                        "created": chrono::Utc::now().timestamp(),
+                                        "model": state.model,
+                                        "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
+                                    })));
+                                }
+                                if is_done && !state.done {
+                                    state.done = true;
+                                    state.eval_s = value["eval_duration"].as_f64().map(|d| d / 1e9);
+                                    let elapsed = state.eval_s.unwrap_or_else(|| state.start.elapsed().as_secs_f64());
+                                    let model = state.model.clone();
                                     let full = state.full.clone();
                                     add_message(cid, "assistant", &full, state.pt, state.ct, Some(&model), Some(elapsed), None, None);
+                                    record_usage(&stats, &model, state.pt, state.ct, elapsed, endpoint);
                                     touch_conversation(cid);
-                                    record_usage(&model, state.pt, state.ct, elapsed, endpoint);
+                                    state.persisted = true;
                                     output.push_str(&format!("data: {}\n\n", json!({
                                         "id": format!("c-{}", chrono::Utc::now().timestamp_millis()),
                                         "object": "chat.completion.chunk",
@@ -545,29 +658,62 @@ fn sse_response(response: reqwest::Response, model: String, mode: SseMode) -> Re
                                             "elapsed_s": (elapsed * 1000.0).round() / 1000.0
                                         }
                                     })));
-                                }
-                                SseMode::OpenAI => {
-                                    record_usage(&model, state.pt, state.ct, elapsed, "/v1/chat/completions");
-                                    output.push_str(&format!("data: {}\n\n", json!({
-                                        "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
-                                        "object": "chat.completion.chunk",
-                                        "created": chrono::Utc::now().timestamp(),
-                                        "model": model,
-                                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
-                                        "usage": {
-                                            "prompt_tokens": state.pt,
-                                            "completion_tokens": state.ct,
-                                            "total_tokens": state.pt + state.ct
-                                        }
-                                    })));
+                                    output.push_str("data: [DONE]\n\n");
                                 }
                             }
-                            output.push_str("data: [DONE]\n\n");
+                            SseMode::OpenAI => {
+                                if !delta.is_empty() {
+                                    state.full.push_str(delta);
+                                }
+                                let mut chunk = json!({
+                                    "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
+                                    "object": "chat.completion.chunk",
+                                    "created": chrono::Utc::now().timestamp(),
+                                    "model": state.model,
+                                    "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
+                                });
+                                if is_done {
+                                    state.done = true;
+                                    let elapsed = value["eval_duration"].as_f64().map(|d| d / 1e9)
+                                        .unwrap_or_else(|| state.start.elapsed().as_secs_f64());
+                                    chunk["choices"][0]["finish_reason"] = json!("stop");
+                                    chunk["usage"] = json!({
+                                        "prompt_tokens": state.pt,
+                                        "completion_tokens": state.ct,
+                                        "total_tokens": state.pt + state.ct
+                                    });
+                                    let model = state.model.clone();
+                                    record_usage(&stats, &model, state.pt, state.ct, elapsed, "/v1/chat/completions");
+                                    state.persisted = true;
+                                    output.push_str(&format!("data: {}\n\n", chunk));
+                                    output.push_str("data: [DONE]\n\n");
+                                } else {
+                                    output.push_str(&format!("data: {}\n\n", chunk));
+                                }
+                            }
                         }
                     }
                     Ok::<_, std::io::Error>(output)
                 }
                 Err(error) => {
+                    // Mirror the Python finally-block: persist whatever streamed
+                    // before the failure, once.
+                    if !state.persisted {
+                        let elapsed = state.start.elapsed().as_secs_f64();
+                        let model = state.model.clone();
+                        match state.mode {
+                            SseMode::Web { cid, endpoint } => {
+                                let full = state.full.clone();
+                                add_message(cid, "assistant", &full, state.pt, state.ct, Some(&model), Some(elapsed), None, None);
+                                record_usage(&stats, &model, state.pt, state.ct, elapsed, endpoint);
+                                touch_conversation(cid);
+                            }
+                            SseMode::OpenAI => {
+                                record_usage(&stats, &model, state.pt, state.ct, elapsed, "/v1/chat/completions");
+                            }
+                        }
+                        state.persisted = true;
+                    }
                     state.done = true;
                     let message = error_chain(&error);
                     Ok::<_, std::io::Error>(format!("data: {}\n\n", json!({"error": message})))
@@ -670,7 +816,7 @@ async fn stream_chat(State(state): State<AppState>, Json(request): Json<SendRequ
     if !response.status().is_success() {
         return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
     }
-    sse_response(response, model, SseMode::Web { cid, endpoint })
+    sse_response(state.stats.clone(), response, model, SseMode::Web { cid, endpoint })
 }
 
 async fn regenerate(State(state): State<AppState>, Json(request): Json<SendRequest>) -> Response {
@@ -678,21 +824,31 @@ async fn regenerate(State(state): State<AppState>, Json(request): Json<SendReque
         Ok(con) => con,
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
     };
-    con.execute(
-        "DELETE FROM messages WHERE id=(SELECT id FROM messages WHERE conversation_id=? AND role='assistant' ORDER BY id DESC LIMIT 1)",
+    // Python checks only the last message: drop it when it is an assistant
+    // reply, otherwise leave the conversation untouched.
+    let last: Option<(i64, String)> = con.query_row(
+        "SELECT id, role FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 1",
         params![request.conversation_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
     ).ok();
+    match last {
+        None => return json_error(StatusCode::BAD_REQUEST, "empty").into_response(),
+        Some((id, role)) => {
+            if role == "assistant" {
+                con.execute("DELETE FROM messages WHERE id=?", params![id]).ok();
+            }
+        }
+    }
     drop(con);
     let history = list_messages(request.conversation_id);
-    let Some(last_user) = history.iter().rev().find(|message| message["role"] == "user") else {
-        return json_error(StatusCode::BAD_REQUEST, "conversation has no user message").into_response();
-    };
+    let last_user = history.iter().rev().find(|message| message["role"] == "user");
+    let content = last_user.and_then(|message| message["content"].as_str()).unwrap_or("").to_string();
     stream_chat(
         State(state),
         Json(SendRequest {
             conversation_id: request.conversation_id,
             message: None,
-            content: last_user["content"].as_str().map(str::to_string),
+            content: Some(content),
             message_id: None,
             skip_add_user: true,
         }),
@@ -784,37 +940,24 @@ async fn test_settings(State(state): State<AppState>, Json(input): Json<Value>) 
 }
 
 // ---- stats: totals + recent requests, and CSV export ----
-async fn stats() -> Response {
-    let Ok(con) = Connection::open(DB_PATH) else {
-        let zero = json!({"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
-        return Json(json!({"totals": zero, "recent": [], "session": zero})).into_response();
+async fn stats(State(state): State<AppState>) -> Response {
+    let zero = json!({"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0});
+    let totals = Connection::open(DB_PATH).ok().and_then(|con| {
+        con.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0) FROM usage",
+            [], |row| Ok(json!({
+                "requests": row.get::<_, i64>(0)?,
+                "prompt_tokens": row.get::<_, i64>(1)?,
+                "completion_tokens": row.get::<_, i64>(2)?,
+                "total_tokens": row.get::<_, i64>(3)?
+            }))
+        ).ok()
+    }).unwrap_or_else(|| zero.clone());
+    let (session, recent) = match state.stats.lock() {
+        Ok(session) => (session.snapshot(), session.recent.clone()),
+        Err(_) => (zero.clone(), Vec::new()),
     };
-    let totals = con.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(prompt_tokens+completion_tokens),0) FROM usage",
-        [], |row| Ok(json!({
-            "requests": row.get::<_, i64>(0)?,
-            "prompt_tokens": row.get::<_, i64>(1)?,
-            "completion_tokens": row.get::<_, i64>(2)?,
-            "total_tokens": row.get::<_, i64>(3)?
-        }))
-    ).unwrap_or_else(|_| json!({"requests": 0, "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}));
-    let Ok(mut statement) = con.prepare(
-        "SELECT ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint FROM usage ORDER BY id DESC LIMIT 50"
-    ) else {
-        return Json(json!({"totals": totals, "recent": [], "session": totals})).into_response();
-    };
-    let recent: Vec<Value> = statement.query_map([], |row| {
-        Ok(json!({
-            "ts": row.get::<_, f64>(0)?,
-            "model": row.get::<_, Option<String>>(1)?,
-            "prompt_tokens": row.get::<_, i64>(2)?,
-            "completion_tokens": row.get::<_, i64>(3)?,
-            "total_tokens": row.get::<_, i64>(4)?,
-            "elapsed_s": row.get::<_, Option<f64>>(5)?,
-            "endpoint": row.get::<_, Option<String>>(6)?
-        }))
-    }).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default();
-    Json(json!({"totals": totals, "recent": recent, "session": totals})).into_response()
+    Json(json!({"totals": totals, "recent": recent, "session": session})).into_response()
 }
 
 async fn stats_export() -> Response {
@@ -888,22 +1031,22 @@ async fn openai_chat(State(state): State<AppState>, Json(input): Json<Value>) ->
         if !response.status().is_success() {
             return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
         }
-        return sse_response(response, model, SseMode::OpenAI);
+        return sse_response(state.stats.clone(), response, model, SseMode::OpenAI);
     }
     let started = Instant::now();
     let response = match reqwest::Client::new().post(format!("{ollama_url}/api/chat")).json(&payload).send().await {
         Ok(response) => response,
-        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error_chain(&error)).into_response(),
+        Err(error) => return upstream_error(&error_chain(&error)).into_response(),
     };
     if !response.status().is_success() {
-        return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
+        return upstream_error(&format!("Ollama returned {}", response.status())).into_response();
     }
     let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     let content = body["message"]["content"].as_str().unwrap_or("");
     let prompt_tokens = body["prompt_eval_count"].as_i64().unwrap_or(0);
     let completion_tokens = body["eval_count"].as_i64().unwrap_or(0);
     let total = prompt_tokens + completion_tokens;
-    record_usage(&model, prompt_tokens, completion_tokens, started.elapsed().as_secs_f64(), "/v1/chat/completions");
+    record_usage(&state.stats, &model, prompt_tokens, completion_tokens, started.elapsed().as_secs_f64(), "/v1/chat/completions");
     Json(json!({
         "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
         "object": "chat.completion", "created": chrono::Utc::now().timestamp(),
@@ -924,15 +1067,15 @@ async fn openai_completion(State(state): State<AppState>, Json(input): Json<Valu
     let started = Instant::now();
     let response = match reqwest::Client::new().post(format!("{ollama_url}/api/generate")).json(&payload).send().await {
         Ok(response) => response,
-        Err(error) => return json_error(StatusCode::BAD_GATEWAY, &error_chain(&error)).into_response(),
+        Err(error) => return upstream_error(&error_chain(&error)).into_response(),
     };
     if !response.status().is_success() {
-        return json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response();
+        return upstream_error(&format!("Ollama returned {}", response.status())).into_response();
     }
     let body = response.json::<Value>().await.unwrap_or_else(|_| json!({}));
     let prompt_tokens = body["prompt_eval_count"].as_i64().unwrap_or(0);
     let completion_tokens = body["eval_count"].as_i64().unwrap_or(0);
-    record_usage(&model, prompt_tokens, completion_tokens, started.elapsed().as_secs_f64(), "/v1/completions");
+    record_usage(&state.stats, &model, prompt_tokens, completion_tokens, started.elapsed().as_secs_f64(), "/v1/completions");
     Json(json!({
         "id": format!("cmpl-{}", chrono::Utc::now().timestamp_millis()),
         "object": "text_completion", "created": chrono::Utc::now().timestamp(),
@@ -952,7 +1095,11 @@ async fn main() {
         .ok()
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_else(|| json!({"model": MODEL, "ollama_url": OLLAMA_URL}));
-    let state = AppState { templates: Arc::new(templates), settings: Arc::new(Mutex::new(settings)) };
+    let state = AppState {
+        templates: Arc::new(templates),
+        settings: Arc::new(Mutex::new(settings)),
+        stats: Arc::new(StdMutex::new(SessionStats::default())),
+    };
 
     let app = Router::new()
         .route("/health", get(health))
