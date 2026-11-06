@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     net::SocketAddr,
+    path::PathBuf,
     pin::Pin,
     sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
@@ -27,7 +28,11 @@ use tower_http::{services::ServeDir, trace::TraceLayer};
 
 const OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const MODEL: &str = "temper-2-ion";
-const DB_PATH: &str = "usage.db";
+fn database_path() -> PathBuf {
+    std::env::var_os("KITE_DB_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("usage.db"))
+}
 
 fn default_model() -> String {
     std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| MODEL.to_string())
@@ -93,6 +98,38 @@ struct AppState {
     stats: Arc<StdMutex<SessionStats>>,
 }
 
+async fn model_supports_thinking(ollama_url: &str, model: &str) -> bool {
+    let client = match reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+    {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let response = match client
+        .post(format!("{ollama_url}/api/show"))
+        .json(&json!({"model": model}))
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        _ => return false,
+    };
+    let metadata: Value = match response.json().await {
+        Ok(metadata) => metadata,
+        Err(_) => return false,
+    };
+    metadata["capabilities"]
+        .as_array()
+        .map(|values| values.iter().any(|value| value.as_str() == Some("thinking")))
+        .unwrap_or(false)
+        || metadata["thinking"]["values"]
+            .as_array()
+            .map(|values| values.iter().any(|value| value.as_bool() == Some(true)))
+            .unwrap_or(false)
+}
+
 #[derive(Default)]
 struct SessionStats {
     requests: i64,
@@ -133,7 +170,7 @@ fn upstream_error(message: &str) -> (StatusCode, Json<Value>) {
 }
 
 fn init_db() -> rusqlite::Result<()> {
-    let con = Connection::open(DB_PATH)?;
+    let con = Connection::open(database_path())?;
     con.execute_batch(
         "CREATE TABLE IF NOT EXISTS conversations (
            id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, model TEXT,
@@ -143,7 +180,7 @@ fn init_db() -> rusqlite::Result<()> {
            id INTEGER PRIMARY KEY AUTOINCREMENT, conversation_id INTEGER NOT NULL,
            role TEXT NOT NULL, content TEXT NOT NULL, prompt_tokens INTEGER DEFAULT 0,
            completion_tokens INTEGER DEFAULT 0, created_at REAL NOT NULL, model TEXT,
-           elapsed_s REAL, branch_of INTEGER, branch_group INTEGER
+            elapsed_s REAL, branch_of INTEGER, branch_group INTEGER, thinking TEXT
          );
          CREATE TABLE IF NOT EXISTS usage (
            id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, model TEXT,
@@ -164,6 +201,7 @@ fn init_db() -> rusqlite::Result<()> {
             ("elapsed_s", "ALTER TABLE messages ADD COLUMN elapsed_s REAL"),
             ("branch_of", "ALTER TABLE messages ADD COLUMN branch_of INTEGER"),
             ("branch_group", "ALTER TABLE messages ADD COLUMN branch_group INTEGER"),
+            ("thinking", "ALTER TABLE messages ADD COLUMN thinking TEXT"),
         ] {
             if !columns.contains(&column.to_string()) {
                 con.execute(ddl, [])?;
@@ -200,10 +238,10 @@ fn record_usage(stats: &StdMutex<SessionStats>, model: &str, pt: i64, ct: i64, e
         }
         session.recent.push(record.clone());
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("usage.log") {
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(usage_log_path()) {
         let _ = writeln!(file, "{}", record);
     }
-    if let Ok(con) = Connection::open(DB_PATH) {
+    if let Ok(con) = Connection::open(database_path()) {
         con.execute(
             "INSERT INTO usage (ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint) VALUES (?,?,?,?,?,?,?)",
             params![
@@ -220,7 +258,7 @@ fn record_usage(stats: &StdMutex<SessionStats>, model: &str, pt: i64, ct: i64, e
 }
 
 fn touch_conversation(cid: i64) {
-    if let Ok(con) = Connection::open(DB_PATH) {
+    if let Ok(con) = Connection::open(database_path()) {
         con.execute("UPDATE conversations SET updated_at=? WHERE id=?", params![now_unix(), cid]).ok();
     }
 }
@@ -371,7 +409,7 @@ async fn render_chat(
         None
     } else {
         requested_id.or_else(|| {
-            Connection::open(DB_PATH).ok().and_then(|con| {
+            Connection::open(database_path()).ok().and_then(|con| {
                 con.query_row("SELECT id FROM conversations ORDER BY updated_at DESC LIMIT 1", [], |row| row.get(0)).ok()
             })
         })
@@ -389,7 +427,7 @@ async fn render_chat(
     context.insert("ollama_json", &serde_json::to_string(&ollama_url(&settings)).unwrap_or_else(|_| format!("\"{}\"", default_ollama_url())));
     context.insert("conv_groups", &group_conversations(conversations));
     context.insert("settings", &settings);
-    context.insert("V", "first-message-fix");
+    context.insert("V", "thinking-history-20261106");
     match state.templates.render("chat.html", &context) {
         Ok(body) => Html(body).into_response(),
         Err(error) => {
@@ -400,7 +438,7 @@ async fn render_chat(
 }
 
 fn list_conversations() -> Vec<Value> {
-    let Ok(con) = Connection::open(DB_PATH) else { return Vec::new() };
+    let Ok(con) = Connection::open(database_path()) else { return Vec::new() };
     let Ok(mut statement) = con.prepare("SELECT id,title,model,created_at,updated_at FROM conversations ORDER BY updated_at DESC") else {
         return Vec::new();
     };
@@ -447,9 +485,9 @@ fn group_conversations(conversations: Vec<Value>) -> Value {
 }
 
 fn list_messages(cid: i64) -> Vec<Value> {
-    let Ok(con) = Connection::open(DB_PATH) else { return Vec::new() };
+    let Ok(con) = Connection::open(database_path()) else { return Vec::new() };
     let Ok(mut statement) = con.prepare(
-        "SELECT id,role,content,prompt_tokens,completion_tokens,created_at,model,elapsed_s,branch_of,branch_group
+        "SELECT id,role,content,prompt_tokens,completion_tokens,created_at,model,elapsed_s,branch_of,branch_group,thinking
          FROM messages WHERE conversation_id=? ORDER BY id"
     ) else { return Vec::new() };
     statement.query_map(params![cid], |row| {
@@ -463,7 +501,8 @@ fn list_messages(cid: i64) -> Vec<Value> {
             "model": row.get::<_, Option<String>>(6)?,
             "elapsed_s": row.get::<_, Option<f64>>(7)?,
             "branch_of": row.get::<_, Option<i64>>(8)?,
-            "branch_group": row.get::<_, Option<i64>>(9)?
+            "branch_group": row.get::<_, Option<i64>>(9)?,
+            "thinking": row.get::<_, Option<String>>(10)?
         }))
     }).map(|rows| rows.filter_map(Result::ok).collect()).unwrap_or_default()
 }
@@ -562,23 +601,44 @@ async fn model_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({"model": configured, "loaded": loaded, "running": running}))
 }
 
-async fn new_conversation(State(state): State<AppState>) -> Json<Value> {
+async fn new_conversation(State(state): State<AppState>) -> Response {
+    match create_conversation(state).await {
+        Ok(id) => Json(json!({"id": id})).into_response(),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
+    }
+}
+
+async fn create_conversation(state: AppState) -> rusqlite::Result<i64> {
     let model = {
         let settings = state.settings.lock().await;
         configured_model(&settings)
     };
     let now = now_unix();
-    let con = Connection::open(DB_PATH).expect("open database");
-    con.execute("INSERT INTO conversations (title, model, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        params![Option::<String>::None, model, now, now]).expect("create conversation");
-    Json(json!({"id": con.last_insert_rowid()}))
+    Connection::open(database_path()).and_then(|con| {
+        con.execute(
+            "INSERT INTO conversations (title, model, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            params![Option::<String>::None, model, now, now],
+        )
+        .map(|_| con.last_insert_rowid())
+    })
 }
 
-async fn delete_conversation(Path(id): Path<i64>) -> Json<Value> {
-    let con = Connection::open(DB_PATH).expect("open database");
-    con.execute("DELETE FROM messages WHERE conversation_id=?", params![id]).ok();
-    con.execute("DELETE FROM conversations WHERE id=?", params![id]).ok();
-    Json(json!({"ok": true}))
+fn usage_log_path() -> PathBuf {
+    std::env::var_os("KITE_USAGE_LOG_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("usage.log"))
+}
+
+async fn delete_conversation(Path(id): Path<i64>) -> Response {
+    match Connection::open(database_path()).and_then(|mut con| {
+        let tx = con.transaction()?;
+        tx.execute("DELETE FROM messages WHERE conversation_id=?", params![id])?;
+        tx.execute("DELETE FROM conversations WHERE id=?", params![id])?;
+        tx.commit()
+    }) {
+        Ok(()) => Json(json!({"ok": true})).into_response(),
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
+    }
 }
 
 #[derive(Default, Deserialize)]
@@ -592,7 +652,7 @@ async fn rename_conversation(Path(id): Path<i64>, body: Result<Json<RenameReques
     if title.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
     }
-    match Connection::open(DB_PATH).and_then(|con| {
+    match Connection::open(database_path()).and_then(|con| {
         con.execute("UPDATE conversations SET title=? WHERE id=?",
             params![truncate_chars(title, 80), id])
     }) {
@@ -611,14 +671,63 @@ fn add_message(
     elapsed: Option<f64>,
     branch_of: Option<i64>,
     branch_group: Option<i64>,
-) -> i64 {
-    let con = Connection::open(DB_PATH).expect("open database");
+    thinking: Option<&str>,
+) -> rusqlite::Result<i64> {
+    let con = Connection::open(database_path())?;
+    insert_message(&con, cid, role, content, pt, ct, model, elapsed, branch_of, branch_group, thinking)
+}
+
+fn insert_message(
+    con: &Connection,
+    cid: i64,
+    role: &str,
+    content: &str,
+    pt: i64,
+    ct: i64,
+    model: Option<&str>,
+    elapsed: Option<f64>,
+    branch_of: Option<i64>,
+    branch_group: Option<i64>,
+    thinking: Option<&str>,
+) -> rusqlite::Result<i64> {
     con.execute(
-        "INSERT INTO messages (conversation_id,role,content,prompt_tokens,completion_tokens,created_at,model,elapsed_s,branch_of,branch_group)
-         VALUES (?,?,?,?,?,?,?,?,?,?)",
-        params![cid, role, content, pt, ct, now_unix(), model, elapsed, branch_of, branch_group],
-    ).expect("insert message");
-    con.last_insert_rowid()
+        "INSERT INTO messages (conversation_id,role,content,prompt_tokens,completion_tokens,created_at,model,elapsed_s,branch_of,branch_group,thinking)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        params![cid, role, content, pt, ct, now_unix(), model, elapsed, branch_of, branch_group, thinking],
+    )?;
+    Ok(con.last_insert_rowid())
+}
+
+fn add_user_message_if_conversation_exists(cid: i64, content: &str) -> rusqlite::Result<bool> {
+    let mut con = Connection::open(database_path())?;
+    add_user_message_to_connection(&mut con, cid, content)
+}
+
+fn add_user_message_to_connection(
+    con: &mut Connection,
+    cid: i64,
+    content: &str,
+) -> rusqlite::Result<bool> {
+    let tx = con.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let exists: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM conversations WHERE id=?)",
+        params![cid],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(false);
+    }
+    insert_message(&tx, cid, "user", content, 0, 0, None, None, None, None, None)?;
+    tx.commit()?;
+    Ok(true)
+}
+
+fn should_persist_stream(stream_failed: bool) -> bool {
+    !stream_failed
+}
+
+fn should_report_empty_answer(full: &str, mode: SseMode, stream_failed: bool) -> bool {
+    !stream_failed && full.is_empty() && matches!(mode, SseMode::Web { .. })
 }
 
 // ---- selection of the same model settings as the web UI ----
@@ -685,6 +794,7 @@ fn persist_stream_finish(
     mode: SseMode,
     model: &str,
     full: &str,
+    thinking: &str,
     pt: i64,
     ct: i64,
     eval_s: Option<f64>,
@@ -694,7 +804,11 @@ fn persist_stream_finish(
     let message_elapsed = eval_s.unwrap_or(wall);
     match mode {
         SseMode::Web { cid, endpoint } => {
-            add_message(cid, "assistant", full, pt, ct, Some(model), Some(message_elapsed), None, None);
+            if !full.is_empty() || !thinking.is_empty() {
+                if let Err(error) = add_message(cid, "assistant", full, pt, ct, Some(model), Some(message_elapsed), None, None, Some(thinking)) {
+                    tracing::error!("failed to persist assistant message: {error}");
+                }
+            }
             record_usage(stats, model, pt, ct, wall, endpoint);
             touch_conversation(cid);
         }
@@ -711,7 +825,7 @@ fn sse_error_response(
     message: String,
     start: Instant,
 ) -> Response {
-    persist_stream_finish(&stats, mode, &model, "", 0, 0, None, start);
+    persist_stream_finish(&stats, mode, &model, "", "", 0, 0, None, start);
     let body = format!(
         "data: {}\n\ndata: [DONE]\n\n",
         json!({"error": message})
@@ -730,6 +844,7 @@ struct SseUnfoldState {
     buf: String,
     output: VecDeque<String>,
     full: String,
+    thinking: String,
     start: Instant,
     done: bool,
     pt: i64,
@@ -741,6 +856,7 @@ struct SseUnfoldState {
     persisted: bool,
     done_sent: bool,
     input_done: bool,
+    stream_failed: bool,
 }
 
 impl SseUnfoldState {
@@ -751,16 +867,26 @@ impl SseUnfoldState {
         self.persisted = true;
         let model = self.model.clone();
         let full = self.full.clone();
-        persist_stream_finish(
-            &self.stats,
-            self.mode,
-            &model,
-            &full,
-            self.pt,
-            self.ct,
-            self.eval_s,
-            self.start,
-        );
+        let thinking = self.thinking.clone();
+        if should_report_empty_answer(&full, self.mode, self.stream_failed) {
+            self.output.push_back(format!(
+                "data: {}\n\n",
+                json!({"error": "The model finished thinking but returned no answer. Try again."})
+            ));
+        }
+        if should_persist_stream(self.stream_failed) {
+            persist_stream_finish(
+                &self.stats,
+                self.mode,
+                &model,
+                &full,
+                &thinking,
+                self.pt,
+                self.ct,
+                self.eval_s,
+                self.start,
+            );
+        }
     }
 
     fn process_line(&mut self, line: String) {
@@ -775,6 +901,10 @@ impl SseUnfoldState {
             Some(content) => content,
             None => "",
         };
+        let thinking = value["message"]["thinking"].as_str().unwrap_or("");
+        if matches!(self.mode, SseMode::Web { .. }) {
+            self.thinking.push_str(thinking);
+        }
         if let Some(count) = value["prompt_eval_count"].as_i64() {
             self.pt = count;
         }
@@ -784,8 +914,12 @@ impl SseUnfoldState {
         let is_done = value["done"].as_bool() == Some(true);
         match self.mode {
             SseMode::Web { .. } => {
-                if !delta.is_empty() {
+                if !delta.is_empty() || !thinking.is_empty() {
                     self.full.push_str(delta);
+                    let mut stream_delta = json!({"content": delta});
+                    if !thinking.is_empty() {
+                        stream_delta["thinking"] = json!(thinking);
+                    }
                     self.output.push_back(format!(
                         "data: {}\n\n",
                         json!({
@@ -793,7 +927,7 @@ impl SseUnfoldState {
                             "object": "chat.completion.chunk",
                             "created": chrono::Utc::now().timestamp(),
                             "model": self.model,
-                            "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": null}]
+                            "choices": [{"index": 0, "delta": stream_delta, "finish_reason": null}]
                         })
                     ));
                 }
@@ -868,6 +1002,13 @@ impl SseUnfoldState {
             if !line.trim().is_empty() {
                 self.process_line(line);
             }
+            if !self.done {
+                self.stream_failed = true;
+                self.output.push_back(format!(
+                    "data: {}\n\n",
+                    json!({"error": "Ollama stream ended before completion."})
+                ));
+            }
             self.input_done = true;
         }
     }
@@ -889,6 +1030,7 @@ fn sse_response(
         buf: String::new(),
         output: VecDeque::new(),
         full: String::new(),
+        thinking: String::new(),
         start,
         done: false,
         pt: 0,
@@ -900,6 +1042,7 @@ fn sse_response(
         persisted: false,
         done_sent: false,
         input_done: false,
+        stream_failed: false,
     };
     let stream = unfold(initial_state, |mut state| async move {
         if state.output.is_empty() {
@@ -915,6 +1058,7 @@ fn sse_response(
                 match state.stream.next().await {
                     Some(Ok(bytes)) => state.process_bytes(&bytes),
                     Some(Err(error)) => {
+                        state.stream_failed = true;
                         state.output.push_back(format!(
                             "data: {}\n\n",
                             json!({"error": error_chain(&error)})
@@ -972,7 +1116,7 @@ async fn stream_chat_mode(state: AppState, request: SendRequest, is_edit: bool) 
     let endpoint;
 
     if is_edit {
-        let con = match Connection::open(DB_PATH) {
+        let con = match Connection::open(database_path()) {
             Ok(con) => con,
             Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
         };
@@ -1016,8 +1160,10 @@ async fn stream_chat_mode(state: AppState, request: SendRequest, is_edit: bool) 
                 let branch_of = branch_of.unwrap_or(mid);
                 let branch_group = branch_group.unwrap_or(mid);
                 drop(con);
-                add_message(row_cid, "user", &content, 0, 0, None, None, Some(branch_of), Some(branch_group));
-                if let Ok(con) = Connection::open(DB_PATH) {
+                if let Err(error) = add_message(row_cid, "user", &content, 0, 0, None, None, Some(branch_of), Some(branch_group), None) {
+                    return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response();
+                }
+                if let Ok(con) = Connection::open(database_path()) {
                     con.execute(
                         "UPDATE conversations SET title=? WHERE id=?",
                         params![truncate_chars(&content, 40), row_cid],
@@ -1035,8 +1181,16 @@ async fn stream_chat_mode(state: AppState, request: SendRequest, is_edit: bool) 
         let Some(cid_value) = cid else {
             return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
         };
-        add_message(cid_value, "user", &content, 0, 0, None, None, None, None);
-        if let Ok(con) = Connection::open(DB_PATH) {
+        match add_user_message_if_conversation_exists(cid_value, &content) {
+            Ok(true) => {}
+            Ok(false) => {
+                return json_error(StatusCode::NOT_FOUND, "conversation not found").into_response();
+            }
+            Err(error) => {
+                return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response();
+            }
+        }
+        if let Ok(con) = Connection::open(database_path()) {
             con.execute(
                 "UPDATE conversations SET title=? WHERE id=? AND (title IS NULL OR title='')",
                 params![truncate_chars(&content, 40), cid_value],
@@ -1055,9 +1209,13 @@ async fn stream_chat_mode(state: AppState, request: SendRequest, is_edit: bool) 
         "stream": true,
         "options": chat_options(&settings)
     });
+    let mut payload = payload;
+    if model_supports_thinking(&ollama_url, &model).await {
+        payload["think"] = json!(true);
+    }
     let client = match reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(30))
-        .timeout(Duration::from_secs(300))
+        .read_timeout(Duration::from_secs(300))
         .build()
     {
         Ok(client) => client,
@@ -1091,11 +1249,13 @@ async fn stream_chat_mode(state: AppState, request: SendRequest, is_edit: bool) 
         }
     };
     if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
         return sse_error_response(
             state.stats.clone(),
             model,
             SseMode::Web { cid, endpoint },
-            format!("Ollama returned {}", response.status()),
+            format!("Ollama returned {status}: {}", body.trim()),
             started,
         );
     }
@@ -1107,7 +1267,7 @@ async fn regenerate(State(state): State<AppState>, body: Result<Json<SendRequest
     let Some(cid) = request.conversation_id else {
         return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
     };
-    let con = match Connection::open(DB_PATH) {
+    let con = match Connection::open(database_path()) {
         Ok(con) => con,
         Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
     };
@@ -1170,11 +1330,22 @@ async fn model_load(State(state): State<AppState>, body: Result<Json<ModelReques
     if loaded {
         return Json(json!({"ok": true, "model": want})).into_response();
     }
-    match reqwest::Client::builder()
+    model_load_with_client(&want, &ollama_url, reqwest::Client::builder()
         .timeout(Duration::from_secs(120))
-        .build()
-        .expect("build ollama client")
-        .post(format!("{ollama_url}/api/generate"))
+        .build())
+        .await
+}
+
+async fn model_load_with_client(
+    want: &str,
+    ollama_url: &str,
+    client: Result<reqwest::Client, reqwest::Error>,
+) -> Response {
+    let client = match client {
+        Ok(client) => client,
+        Err(error) => return model_load_client_error_response(error),
+    };
+    match client.post(format!("{ollama_url}/api/generate"))
         .json(&json!({"model": want, "prompt": "hi"}))
         .send().await {
         Ok(response) if response.status().is_success() => Json(json!({"ok": true, "model": want})).into_response(),
@@ -1190,11 +1361,14 @@ async fn model_unload(State(state): State<AppState>, body: Result<Json<ModelRequ
         (request.model.clone().filter(|model| !model.is_empty()).unwrap_or_else(|| configured_model(&settings)),
          ollama_url(&settings))
     };
-    match reqwest::Client::builder()
+    let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .build()
-        .expect("build ollama client")
-        .post(format!("{ollama_url}/api/generate"))
+    {
+        Ok(client) => client,
+        Err(error) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response(),
+    };
+    match client.post(format!("{ollama_url}/api/generate"))
         .json(&json!({"model": model, "prompt": "", "keep_alive": 0})).send().await {
         Ok(response) if response.status().is_success() => Json(json!({"ok": true})).into_response(),
         Ok(response) => json_error(StatusCode::BAD_GATEWAY, &format!("Ollama returned {}", response.status())).into_response(),
@@ -1205,18 +1379,36 @@ async fn model_unload(State(state): State<AppState>, body: Result<Json<ModelRequ
 async fn save_settings(State(state): State<AppState>, body: Result<Json<Value>, axum::extract::rejection::JsonRejection>) -> Response {
     let input = body.map(|Json(value)| value).unwrap_or_else(|_| json!({}));
     let mut settings = state.settings.lock().await;
+    save_settings_to_path(&mut settings, &input, &settings_path())
+}
+
+fn model_load_client_error_response(error: reqwest::Error) -> Response {
+    json_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()).into_response()
+}
+
+fn settings_path() -> PathBuf {
+    std::env::var_os("KITE_SETTINGS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("settings.json"))
+}
+
+fn save_settings_to_path(settings: &mut Value, input: &Value, path: &std::path::Path) -> Response {
+    let mut updated = settings.clone();
     if let Some(object) = input.as_object() {
         for key in ["ollama_url", "model", "temperature", "top_p", "top_k", "repeat_penalty", "max_tokens", "num_ctx", "input_price", "output_price", "usd_to_idr"] {
             if let Some(value) = object.get(key) {
-                settings[key] = value.clone();
+                updated[key] = value.clone();
             }
         }
     }
-    match serde_json::to_string_pretty(&*settings)
-        .ok()
-        .and_then(|text| std::fs::write("settings.json", text).ok()) {
-        Some(()) => Json(json!({"ok": true})).into_response(),
-        None => json_error(StatusCode::INTERNAL_SERVER_ERROR, "failed to save settings").into_response(),
+    match serde_json::to_string_pretty(&updated)
+        .map_err(|error| error.to_string())
+        .and_then(|text| std::fs::write(path, text).map_err(|error| error.to_string())) {
+        Ok(()) => {
+            *settings = updated;
+            Json(json!({"ok": true})).into_response()
+        }
+        Err(error) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &error).into_response(),
     }
 }
 
@@ -1253,7 +1445,7 @@ async fn stats(State(state): State<AppState>) -> Response {
         Ok(session) => (session.snapshot(), session.recent.clone()),
         Err(_) => (zero.clone(), Vec::new()),
     };
-    let totals = Connection::open(DB_PATH).ok().and_then(|con| {
+    let totals = Connection::open(database_path()).ok().and_then(|con| {
         con.query_row(
             "SELECT COUNT(*), COALESCE(SUM(prompt_tokens),0), COALESCE(SUM(completion_tokens),0), COALESCE(SUM(total_tokens),0) FROM usage",
             [], |row| Ok(json!({
@@ -1269,7 +1461,7 @@ async fn stats(State(state): State<AppState>) -> Response {
 
 async fn stats_export() -> Response {
     let mut body = String::from("ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint\n");
-    if let Ok(con) = Connection::open(DB_PATH) {
+    if let Ok(con) = Connection::open(database_path()) {
         if let Ok(mut statement) = con.prepare(
             "SELECT ts,model,prompt_tokens,completion_tokens,total_tokens,elapsed_s,endpoint FROM usage ORDER BY id"
         ) {
@@ -1467,7 +1659,11 @@ async fn main() {
         .with_state(state)
         .layer(TraceLayer::new_for_http())
         .layer(middleware::from_fn(auth_middleware));
-    let address = SocketAddr::from(([127, 0, 0, 1], 8090));
+    let port = std::env::var("PROXY_PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(8090);
+    let address = SocketAddr::from(([127, 0, 0, 1], port));
 
     tracing::info!("Rust proxy listening on {}", address);
     let listener = tokio::net::TcpListener::bind(address)
@@ -1476,4 +1672,658 @@ async fn main() {
     axum::serve(listener, app)
         .await
         .expect("Rust proxy server failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{
+        body::to_bytes,
+        http::Request as HttpRequest,
+        routing::post,
+    };
+    use futures_util::stream;
+    use std::sync::{Mutex, OnceLock};
+    use tower::ServiceExt;
+
+    static DB_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    fn isolated_db() -> (std::sync::MutexGuard<'static, ()>, PathBuf) {
+        let guard = DB_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = std::env::temp_dir().join(format!(
+            "kite-test-{}-{}.db",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        unsafe { std::env::set_var("KITE_DB_PATH", &path) };
+        let usage_log = path.with_extension("log");
+        unsafe { std::env::set_var("KITE_USAGE_LOG_PATH", &usage_log) };
+        init_db().unwrap();
+        (guard, path)
+    }
+
+    fn cleanup_db(path: &PathBuf) {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path.with_extension("db-wal"));
+        let _ = std::fs::remove_file(path.with_extension("db-shm"));
+        let _ = std::fs::remove_file(path.with_extension("log"));
+        unsafe { std::env::remove_var("KITE_DB_PATH") };
+        unsafe { std::env::remove_var("KITE_USAGE_LOG_PATH") };
+    }
+
+    fn create_test_conversation() -> i64 {
+        let con = Connection::open(database_path()).unwrap();
+        let now = now_unix();
+        con.execute(
+            "INSERT INTO conversations (title,model,created_at,updated_at) VALUES ('test','mock-model',?,?)",
+            params![now, now],
+        )
+        .unwrap();
+        con.last_insert_rowid()
+    }
+
+    fn test_app(ollama_url: String) -> Router {
+        let state = AppState {
+            templates: Arc::new(Tera::default()),
+            settings: Arc::new(tokio::sync::Mutex::new(json!({
+                "model": "mock-model",
+                "ollama_url": ollama_url,
+                "input_price": 0.12,
+                "max_tokens": 16,
+                "num_ctx": 128,
+                "output_price": 0.2,
+                "usd_to_idr": 16000,
+                "temperature": 0.2,
+                "top_p": 0.8,
+                "top_k": 20,
+                "repeat_penalty": 1.05
+            }))),
+            stats: Arc::new(StdMutex::new(SessionStats::default())),
+        };
+        Router::new()
+            .route("/health", get(health))
+            .route("/login", get(login_get).post(login_post))
+            .route("/logout", get(logout))
+            .route("/api/chat/send", post(send_stream_chat))
+            .route("/api/chat/edit", post(edit_stream_chat))
+            .route("/api/chat/regenerate", post(regenerate))
+            .route("/v1/chat/completions", post(openai_chat))
+            .route("/v1/completions", post(openai_completion))
+            .route("/api/conversations/new", post(new_conversation))
+            .route("/api/conversations/{id}", delete(delete_conversation))
+            .route("/api/conversations/{id}/rename", post(rename_conversation))
+            .route("/api/settings", post(save_settings))
+            .route("/api/models", get(models))
+            .route("/api/model_status", get(model_status))
+            .route("/api/model_load", post(model_load))
+            .route("/api/model_unload", post(model_unload))
+            .route("/models", get(models))
+            .route("/v1/models", get(models))
+            .route("/stats", get(stats))
+            .route("/stats/export", get(stats_export))
+            .route("/api/stats", get(stats))
+            .with_state(state)
+    }
+
+    async fn mock_ollama(
+        response: &'static str,
+        status: StatusCode,
+        capabilities: &'static str,
+    ) -> (String, tokio::task::JoinHandle<()>, Arc<StdMutex<Option<Value>>>) {
+        let captured = Arc::new(StdMutex::new(None));
+        let captured_chat = captured.clone();
+        let chat = move |request: axum::extract::Request| async move {
+            let bytes = axum::body::to_bytes(request.into_body(), usize::MAX).await.unwrap();
+            if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
+                *captured_chat.lock().unwrap() = Some(value);
+            }
+            (
+                status,
+                [(header::CONTENT_TYPE, "application/x-ndjson")],
+                response,
+            )
+        };
+        let generate_response = response.to_string();
+        let generate_status = status;
+        let show_capabilities = capabilities;
+        let app = Router::new()
+            .route("/api/chat", post(chat))
+            .route("/api/show", post(move || async move { axum::Json(json!({"capabilities": show_capabilities.split(',').collect::<Vec<_>>()})) }))
+            .route("/api/tags", get(|| async { axum::Json(json!({"models":[{"name":"mock-model"}]})) }))
+            .route("/api/ps", get(|| async { axum::Json(json!({"models":[]})) }))
+            .route("/api/generate", post(move || async move {
+                (
+                    generate_status,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    generate_response.clone(),
+                )
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task, captured)
+    }
+
+    async fn mock_generate(
+        response: &'static str,
+        status: StatusCode,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let generate = move |request: axum::extract::Request| async move {
+                let _ = axum::body::to_bytes(request.into_body(), usize::MAX).await;
+                (status, [(header::CONTENT_TYPE, "application/json")], response)
+            };
+        let app = Router::new().route("/api/generate", post(generate));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{address}"), task)
+    }
+
+    fn test_state() -> SseUnfoldState {
+        SseUnfoldState {
+            stream: Box::pin(stream::empty()),
+            buf: String::new(),
+            output: VecDeque::new(),
+            full: "partial response".to_string(),
+            thinking: "partial thought".to_string(),
+            start: Instant::now(),
+            done: false,
+            pt: 0,
+            ct: 0,
+            eval_s: None,
+            model: "test-model".to_string(),
+            mode: SseMode::Web {
+                cid: 1,
+                endpoint: "/web/chat",
+            },
+            stats: Arc::new(StdMutex::new(SessionStats::default())),
+            persisted: false,
+            done_sent: false,
+            input_done: false,
+            stream_failed: false,
+        }
+    }
+
+    #[test]
+    fn missing_conversation_is_not_inserted() {
+        let mut con = Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE conversations(id INTEGER PRIMARY KEY);
+             CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations(id), role TEXT NOT NULL, content TEXT NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER, created_at REAL, model TEXT, elapsed_s REAL, branch_of INTEGER, branch_group INTEGER, thinking TEXT);",
+        )
+        .unwrap();
+        assert!(!add_user_message_to_connection(&mut con, 456, "must not insert").unwrap());
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn existing_conversation_insert_is_atomic_and_succeeds() {
+        let mut con = Connection::open_in_memory().unwrap();
+        con.execute_batch(
+            "PRAGMA foreign_keys=ON;
+             CREATE TABLE conversations(id INTEGER PRIMARY KEY);
+             CREATE TABLE messages(id INTEGER PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations(id), role TEXT NOT NULL, content TEXT NOT NULL, prompt_tokens INTEGER, completion_tokens INTEGER, created_at REAL, model TEXT, elapsed_s REAL, branch_of INTEGER, branch_group INTEGER, thinking TEXT);
+             INSERT INTO conversations(id) VALUES (9);",
+        )
+        .unwrap();
+        assert!(add_user_message_to_connection(&mut con, 9, "hello").unwrap());
+        let (role, content): (String, String) = con
+            .query_row("SELECT role,content FROM messages", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!((role.as_str(), content.as_str()), ("user", "hello"));
+    }
+
+    #[test]
+    fn failed_stream_does_not_persist_partial_assistant_turn() {
+        let mut state = test_state();
+        state.finish_input();
+        assert!(state.stream_failed);
+        assert!(state
+            .output
+            .iter()
+            .any(|event| event.contains("ended before completion")));
+        state.persist_once();
+        assert!(state.persisted);
+        assert!(!state
+            .output
+            .iter()
+            .any(|event| event.contains("returned no answer")));
+        assert!(!should_persist_stream(state.stream_failed));
+        assert!(!should_report_empty_answer("", state.mode, state.stream_failed));
+    }
+
+    #[test]
+    fn completed_empty_stream_reports_no_answer() {
+        let mut state = test_state();
+        state.full.clear();
+        state.thinking.clear();
+        state.persist_once();
+        assert!(state
+            .output
+            .iter()
+            .any(|event| event.contains("returned no answer")));
+        assert!(should_report_empty_answer("", state.mode, false));
+        assert!(!should_report_empty_answer("answer", state.mode, false));
+    }
+
+    #[tokio::test]
+    async fn mock_ollama_chat_persists_answer_and_thinking() {
+        let (guard, path) = isolated_db();
+        let cid = create_test_conversation();
+        let response = "{\"message\":{\"role\":\"assistant\",\"thinking\":\"reasoning\",\"content\":\"OK\"},\"done\":false}\n{\"message\":{\"role\":\"assistant\",\"thinking\":\" more\",\"content\":\"!\"},\"done\":true,\"prompt_eval_count\":2,\"eval_count\":3,\"eval_duration\":1000000000}\n";
+        let (url, server, _) = mock_ollama(response, StatusCode::OK, "").await;
+        let app = test_app(url);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/chat/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"conversation_id":cid,"message":"hello"}).to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("\"content\":\"OK\""));
+        assert!(body.contains("\"thinking\":\"reasoning\""));
+        assert!(body.contains("\"content\":\"!\""));
+        assert!(body.contains("[DONE]"));
+        let con = Connection::open(&path).unwrap();
+        let saved: (String, String) = con.query_row(
+            "SELECT content,thinking FROM messages WHERE conversation_id=? AND role='assistant'",
+            params![cid],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(saved, ("OK!".to_string(), "reasoning more".to_string()));
+        server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn web_chat_request_contains_thinking_flag_and_configured_options() {
+        let (guard, path) = isolated_db();
+        let cid = create_test_conversation();
+        let app_response = "{\"message\":{\"role\":\"assistant\",\"content\":\"OK\"},\"done\":true}\n";
+        let (url, server, captured) = mock_ollama(app_response, StatusCode::OK, "thinking").await;
+        let app = test_app(url);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/chat/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"conversation_id":cid,"message":"hello"}).to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        let _ = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let payload = captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone().unwrap();
+        assert_eq!(payload["model"], "mock-model");
+        assert_eq!(payload["think"], true);
+        assert_eq!(payload["options"]["num_predict"].as_f64(), Some(16.0));
+        assert_eq!(payload["options"]["num_ctx"].as_f64(), Some(128.0));
+        server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn mock_ollama_http_error_is_sse_and_does_not_persist_answer() {
+        let (guard, path) = isolated_db();
+        let cid = create_test_conversation();
+        let (url, server, _) = mock_ollama(
+            "{\"error\":\"mock failure\"}\n",
+            StatusCode::BAD_REQUEST,
+            "",
+        ).await;
+        let app = test_app(url);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/chat/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"conversation_id":cid,"message":"hello"}).to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("Ollama returned 400 Bad Request"));
+        assert!(body.contains("mock failure"));
+        let con = Connection::open(&path).unwrap();
+        let assistants: i64 = con.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND role='assistant'",
+            params![cid],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(assistants, 0);
+        server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn edit_and_regenerate_reach_mock_chat_and_persist_results() {
+        let (guard, path) = isolated_db();
+        let cid = create_test_conversation();
+        let con = Connection::open(&path).unwrap();
+        let user_id = add_message(cid, "user", "original", 0, 0, None, None, None, None, None).unwrap();
+        drop(con);
+        let response = "{\"message\":{\"role\":\"assistant\",\"content\":\"edited reply\"},\"done\":true}\n";
+        let (url, server, _) = mock_ollama(response, StatusCode::OK, "").await;
+        let app = test_app(url.clone());
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/chat/edit")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"conversation_id":cid,"message_id":user_id,"message":"edited"}).to_string()))
+            .unwrap();
+        let edit = app.oneshot(request).await.unwrap();
+        assert_eq!(edit.status(), StatusCode::OK);
+        let edit_body = to_bytes(edit.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(edit_body.to_vec()).unwrap().contains("edited reply"));
+
+        let app = test_app(url);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/chat/regenerate")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"conversation_id":cid}).to_string()))
+            .unwrap();
+        let regen = app.oneshot(request).await.unwrap();
+        assert_eq!(regen.status(), StatusCode::OK);
+        let regen_body = to_bytes(regen.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(regen_body.to_vec()).unwrap().contains("edited reply"));
+
+        let con = Connection::open(&path).unwrap();
+        let replies: i64 = con.query_row(
+            "SELECT COUNT(*) FROM messages WHERE conversation_id=? AND role='assistant' AND content='edited reply'",
+            params![cid],
+            |row| row.get(0),
+        ).unwrap();
+        assert_eq!(replies, 1);
+        server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn openai_compatible_chat_and_completion_return_mock_outputs() {
+        let (guard, path) = isolated_db();
+        let chat_response = "{\"message\":{\"role\":\"assistant\",\"content\":\"chat result\"},\"done\":true,\"prompt_eval_count\":4,\"eval_count\":2}\n";
+        let (url, server, _) = mock_ollama(chat_response, StatusCode::OK, "").await;
+        let app = test_app(url.clone());
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"messages":[{"role":"user","content":"hello"}],"stream":false}).to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("chat result"));
+
+        let generate_response = "{\"response\":\"completion result\",\"done\":true,\"prompt_eval_count\":3,\"eval_count\":2}";
+        let (generate_url, generate_server) = mock_generate(generate_response, StatusCode::OK).await;
+        let app = test_app(generate_url);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"prompt":"hello"}).to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("completion result"));
+        server.abort();
+        generate_server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn openai_streaming_chat_uses_sse_and_omits_internal_thinking() {
+        let (guard, path) = isolated_db();
+        let response = "{\"message\":{\"role\":\"assistant\",\"thinking\":\"private thought\",\"content\":\"streamed\"},\"done\":true,\"prompt_eval_count\":1,\"eval_count\":1}\n";
+        let (url, server, _) = mock_ollama(response, StatusCode::OK, "").await;
+        let app = test_app(url);
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(json!({"messages":[{"role":"user","content":"hello"}],"stream":true}).to_string()))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("streamed"));
+        assert!(body.contains("[DONE]"));
+        assert!(!body.contains("private thought"));
+        server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn conversation_crud_settings_models_and_stats_routes_work() {
+        let (guard, path) = isolated_db();
+        let settings_path = path.with_extension("settings.json");
+        unsafe { std::env::set_var("KITE_SETTINGS_PATH", &settings_path) };
+        let (url, server, _) = mock_ollama("{}", StatusCode::OK, "").await;
+        let app = test_app(url);
+
+        let new = app.clone().oneshot(
+            HttpRequest::builder().method("POST").uri("/api/conversations/new").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(new.status(), StatusCode::OK);
+        let body = to_bytes(new.into_body(), usize::MAX).await.unwrap();
+        let cid = serde_json::from_slice::<Value>(&body).unwrap()["id"].as_i64().unwrap();
+
+        let rename = app.clone().oneshot(
+            HttpRequest::builder().method("POST").uri(format!("/api/conversations/{cid}/rename"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"title":"renamed"}).to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(rename.status(), StatusCode::OK);
+
+        let settings = app.clone().oneshot(
+            HttpRequest::builder().method("POST").uri("/api/settings")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(json!({"model":"mock-model","temperature":0.5}).to_string())).unwrap()
+        ).await.unwrap();
+        assert_eq!(settings.status(), StatusCode::OK);
+        assert_eq!(std::fs::read_to_string(&settings_path).unwrap().contains("mock-model"), true);
+
+        let models = app.clone().oneshot(
+            HttpRequest::builder().method("GET").uri("/api/models").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(models.status(), StatusCode::OK);
+        let body = to_bytes(models.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8(body.to_vec()).unwrap().contains("mock-model"));
+
+        let stats = app.clone().oneshot(
+            HttpRequest::builder().method("GET").uri("/api/stats").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(stats.status(), StatusCode::OK);
+
+        let delete = app.oneshot(
+            HttpRequest::builder().method("DELETE").uri(format!("/api/conversations/{cid}")).body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(delete.status(), StatusCode::OK);
+        let con = Connection::open(&path).unwrap();
+        let count: i64 = con.query_row("SELECT COUNT(*) FROM conversations WHERE id=?", params![cid], |row| row.get(0)).unwrap();
+        assert_eq!(count, 0);
+        server.abort();
+        cleanup_db(&path);
+        let _ = std::fs::remove_file(&settings_path);
+        unsafe { std::env::remove_var("KITE_SETTINGS_PATH") };
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn auth_allows_health_and_requires_auth_for_api_routes() {
+        let (guard, path) = isolated_db();
+        let (url, server, _) = mock_ollama("{}", StatusCode::OK, "").await;
+        let app = Router::new()
+            .route("/health", get(health))
+            .route("/api/models", get(models))
+            .with_state(AppState {
+                templates: Arc::new(Tera::default()),
+                settings: Arc::new(tokio::sync::Mutex::new(json!({"model":"mock-model","ollama_url":url}))),
+                stats: Arc::new(StdMutex::new(SessionStats::default())),
+            })
+            .layer(middleware::from_fn(auth_middleware));
+        let health = app.clone().oneshot(
+            HttpRequest::builder().method("GET").uri("/health").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(health.status(), StatusCode::OK);
+        let protected = app.oneshot(
+            HttpRequest::builder().method("GET").uri("/api/models").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(protected.status(), StatusCode::UNAUTHORIZED);
+        server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn conversation_creation_reports_database_errors_instead_of_panicking() {
+        let (guard, path) = isolated_db();
+        let dir = path.with_extension("directory");
+        std::fs::create_dir_all(&dir).unwrap();
+        unsafe { std::env::set_var("KITE_DB_PATH", &dir) };
+        let state = AppState {
+            templates: Arc::new(Tera::default()),
+            settings: Arc::new(tokio::sync::Mutex::new(json!({"model":"mock-model"}))),
+            stats: Arc::new(StdMutex::new(SessionStats::default())),
+        };
+        let result = create_conversation(state).await;
+        assert!(result.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn model_status_reports_mock_running_state() {
+        let (guard, path) = isolated_db();
+        let (url, server, _) = mock_ollama("{}", StatusCode::OK, "").await;
+        let app = test_app(url);
+        let response = app.oneshot(
+            HttpRequest::builder().method("GET").uri("/api/model_status").body(Body::empty()).unwrap()
+        ).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(value["loaded"], false);
+        server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn model_load_and_unload_use_mock_ollama_only() {
+        let (guard, path) = isolated_db();
+        let (url, server, _) = mock_ollama("{}", StatusCode::OK, "").await;
+        let response = model_load_with_client("mock-model", &url, reqwest::Client::builder().build()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let client_error = reqwest::Client::builder().build().err();
+        if let Some(error) = client_error {
+            let response = model_load_client_error_response(error);
+            assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        } else {
+            assert_eq!(
+                model_load_client_error_response(reqwest::Client::new().get("/").build().unwrap_err()).status(),
+                StatusCode::INTERNAL_SERVER_ERROR
+            );
+        }
+        let app = test_app(url);
+        let load = app.clone().oneshot(
+            HttpRequest::builder().method("POST").uri("/api/model_load")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}")).unwrap()
+        ).await.unwrap();
+        assert_eq!(load.status(), StatusCode::OK);
+        let unload = app.oneshot(
+            HttpRequest::builder().method("POST").uri("/api/model_unload")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}" )).unwrap()
+        ).await.unwrap();
+        assert_eq!(unload.status(), StatusCode::OK);
+        server.abort();
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[test]
+    fn migration_adds_thinking_column_to_legacy_messages() {
+        let (guard, path) = isolated_db();
+        let con = Connection::open(&path).unwrap();
+        con.execute("DROP TABLE messages", []).unwrap();
+        con.execute_batch(
+            "CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                conversation_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                prompt_tokens INTEGER DEFAULT 0,
+                completion_tokens INTEGER DEFAULT 0,
+                created_at REAL NOT NULL,
+                model TEXT,
+                elapsed_s REAL,
+                branch_of INTEGER,
+                branch_group INTEGER
+            );",
+        )
+        .unwrap();
+        drop(con);
+        init_db().unwrap();
+        let con = Connection::open(&path).unwrap();
+        let has_thinking = con
+            .prepare("PRAGMA table_info(messages)")
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .any(|column| column.as_deref() == Ok("thinking"));
+        assert!(has_thinking);
+        cleanup_db(&path);
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn deleted_conversation_request_returns_404_without_ollama_call() {
+        let (guard, path) = isolated_db();
+        let app = test_app("http://127.0.0.1:1".to_string());
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/api/chat/send")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"conversation_id":456,"message":"hello"}).to_string(),
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let con = Connection::open(&path).unwrap();
+        assert_eq!(
+            con.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        cleanup_db(&path);
+        drop(guard);
+    }
 }
