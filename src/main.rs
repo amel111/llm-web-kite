@@ -119,7 +119,7 @@ async fn health(State(state): State<AppState>) -> Json<Value> {
         "status": "ok",
         "model": configured_model(&settings),
         "ollama": ollama_url(&settings),
-        "version": "2.0-rust",
+        "version": "2.0",
     }))
 }
 
@@ -581,12 +581,13 @@ async fn delete_conversation(Path(id): Path<i64>) -> Json<Value> {
     Json(json!({"ok": true}))
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct RenameRequest {
     title: Option<String>,
 }
 
-async fn rename_conversation(Path(id): Path<i64>, Json(request): Json<RenameRequest>) -> Response {
+async fn rename_conversation(Path(id): Path<i64>, body: Result<Json<RenameRequest>, axum::extract::rejection::JsonRejection>) -> Response {
+    let request = body.map(|Json(value)| value).unwrap_or_default();
     let title = request.title.as_deref().unwrap_or("").trim();
     if title.is_empty() {
         return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
@@ -663,7 +664,7 @@ fn active_chat_history(cid: i64) -> Value {
     Value::Array(history)
 }
 
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct SendRequest {
     conversation_id: Option<i64>,
     message: Option<String>,
@@ -942,16 +943,16 @@ fn sse_response(
 
 async fn send_stream_chat(
     State(state): State<AppState>,
-    Json(request): Json<SendRequest>,
+    body: Result<Json<SendRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    stream_chat_mode(state, request, false).await
+    stream_chat_mode(state, body.map(|Json(value)| value).unwrap_or_default(), false).await
 }
 
 async fn edit_stream_chat(
     State(state): State<AppState>,
-    Json(request): Json<SendRequest>,
+    body: Result<Json<SendRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
-    stream_chat_mode(state, request, true).await
+    stream_chat_mode(state, body.map(|Json(value)| value).unwrap_or_default(), true).await
 }
 
 async fn stream_chat_mode(state: AppState, request: SendRequest, is_edit: bool) -> Response {
@@ -1101,7 +1102,8 @@ async fn stream_chat_mode(state: AppState, request: SendRequest, is_edit: bool) 
     sse_response(state.stats.clone(), response, model, SseMode::Web { cid, endpoint })
 }
 
-async fn regenerate(State(state): State<AppState>, Json(request): Json<SendRequest>) -> Response {
+async fn regenerate(State(state): State<AppState>, body: Result<Json<SendRequest>, axum::extract::rejection::JsonRejection>) -> Response {
+    let request = body.map(|Json(value)| value).unwrap_or_default();
     let Some(cid) = request.conversation_id else {
         return json_error(StatusCode::BAD_REQUEST, "missing").into_response();
     };
@@ -1149,12 +1151,13 @@ async fn regenerate(State(state): State<AppState>, Json(request): Json<SendReque
 }
 
 // ---- model load/unload (checks Ollama state first, like the Python version) ----
-#[derive(Deserialize)]
+#[derive(Default, Deserialize)]
 struct ModelRequest {
     model: Option<String>,
 }
 
-async fn model_load(State(state): State<AppState>, Json(request): Json<ModelRequest>) -> Response {
+async fn model_load(State(state): State<AppState>, body: Result<Json<ModelRequest>, axum::extract::rejection::JsonRejection>) -> Response {
+    let request = body.map(|Json(value)| value).unwrap_or_default();
     let (want, ollama_url) = {
         let settings = state.settings.lock().await;
         let raw = request.model.clone().filter(|model| !model.is_empty()).unwrap_or_else(|| configured_model(&settings));
@@ -1180,7 +1183,8 @@ async fn model_load(State(state): State<AppState>, Json(request): Json<ModelRequ
     }
 }
 
-async fn model_unload(State(state): State<AppState>, Json(request): Json<ModelRequest>) -> Response {
+async fn model_unload(State(state): State<AppState>, body: Result<Json<ModelRequest>, axum::extract::rejection::JsonRejection>) -> Response {
+    let request = body.map(|Json(value)| value).unwrap_or_default();
     let (model, ollama_url) = {
         let settings = state.settings.lock().await;
         (request.model.clone().filter(|model| !model.is_empty()).unwrap_or_else(|| configured_model(&settings)),
@@ -1198,7 +1202,8 @@ async fn model_unload(State(state): State<AppState>, Json(request): Json<ModelRe
     }
 }
 
-async fn save_settings(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn save_settings(State(state): State<AppState>, body: Result<Json<Value>, axum::extract::rejection::JsonRejection>) -> Response {
+    let input = body.map(|Json(value)| value).unwrap_or_else(|_| json!({}));
     let mut settings = state.settings.lock().await;
     if let Some(object) = input.as_object() {
         for key in ["ollama_url", "model", "temperature", "top_p", "top_k", "repeat_penalty", "max_tokens", "num_ctx", "input_price", "output_price", "usd_to_idr"] {
@@ -1215,7 +1220,8 @@ async fn save_settings(State(state): State<AppState>, Json(input): Json<Value>) 
     }
 }
 
-async fn test_settings(State(state): State<AppState>, Json(input): Json<Value>) -> Json<Value> {
+async fn test_settings(State(state): State<AppState>, body: Result<Json<Value>, axum::extract::rejection::JsonRejection>) -> Json<Value> {
+    let input = body.map(|Json(value)| value).unwrap_or_else(|_| json!({}));
     let fallback = {
         let settings = state.settings.lock().await;
         ollama_url(&settings)
@@ -1321,7 +1327,8 @@ fn build_chat_options(input: &Value) -> Value {
     Value::Object(options)
 }
 
-async fn openai_chat(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn openai_chat(State(state): State<AppState>, body: Result<Json<Value>, axum::extract::rejection::JsonRejection>) -> Response {
+    let input = body.map(|Json(value)| value).unwrap_or_else(|_| json!({}));
     let (model, ollama_url) = {
         let settings = state.settings.lock().await;
         (
@@ -1384,7 +1391,8 @@ async fn openai_chat(State(state): State<AppState>, Json(input): Json<Value>) ->
     })).into_response()
 }
 
-async fn openai_completion(State(state): State<AppState>, Json(input): Json<Value>) -> Response {
+async fn openai_completion(State(state): State<AppState>, body: Result<Json<Value>, axum::extract::rejection::JsonRejection>) -> Response {
+    let input = body.map(|Json(value)| value).unwrap_or_else(|_| json!({}));
     let (model, ollama_url) = {
         let settings = state.settings.lock().await;
         (
