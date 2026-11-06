@@ -389,7 +389,7 @@ async fn render_chat(
     context.insert("ollama_json", &serde_json::to_string(&ollama_url(&settings)).unwrap_or_else(|_| format!("\"{}\"", default_ollama_url())));
     context.insert("conv_groups", &group_conversations(conversations));
     context.insert("settings", &settings);
-    context.insert("V", "rust-gap");
+    context.insert("V", "first-message-fix");
     match state.templates.render("chat.html", &context) {
         Ok(body) => Html(body).into_response(),
         Err(error) => {

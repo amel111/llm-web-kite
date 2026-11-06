@@ -913,12 +913,10 @@
     var text = ta.value.trim();
     if (streamActive) { if (controller) controller.abort(); return; }
     if (!text) return;
-    var createdConversation = false;
     if (!convId) {
       var r = await fetch("/api/conversations/new", { method: "POST" });
       var d = await r.json();
       convId = d.id;
-      createdConversation = true;
       insertConvItem(convId, text.slice(0, 40));
     }
     emptyEl.style.display = "none";
@@ -926,7 +924,7 @@
     autosize();
     buildUserRow({ role: "user", id: null, content: text });
     forceScrollBottom();
-    streamReply({ conversation_id: convId, message: text, skip_add_user: createdConversation }, "/api/chat/send");
+    streamReply({ conversation_id: convId, message: text }, "/api/chat/send");
   }
   sendBtn.addEventListener("click", send);
   ta.addEventListener("keydown", function (e) {
