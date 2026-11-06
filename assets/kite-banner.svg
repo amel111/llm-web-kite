@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="360" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+  <title id="title">Kite — local AI, on your terms</title>
+  <desc id="desc">A dark indigo banner with a paper kite, Rust gear mark, and Ollama-inspired connected dots.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10152d"/>
+      <stop offset="0.55" stop-color="#1c2850"/>
+      <stop offset="1" stop-color="#152a3a"/>
+    </linearGradient>
+    <linearGradient id="kite" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7dd3fc"/>
+      <stop offset="1" stop-color="#a5f3fc"/>
+    </linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="18"/>
+    </filter>
+  </defs>
+  <rect width="1200" height="360" rx="28" fill="url(#bg)"/>
+  <circle cx="1040" cy="64" r="90" fill="#67e8f9" opacity=".12" filter="url(#glow)"/>
+  <circle cx="130" cy="320" r="100" fill="#fb923c" opacity=".1" filter="url(#glow)"/>
+  <path d="M0 282C190 220 265 338 462 269s290-105 431-48 214 41 307-13v152H0Z" fill="#0b1228" opacity=".42"/>
+
+  <!-- Original paper-kite symbol -->
+  <g transform="translate(150 174)">
+    <path d="M0-96 78 8 0 64-78 8Z" fill="url(#kite)"/>
+    <path d="M0-96 0 64M-78 8 0-18 78 8" fill="none" stroke="#12304b" stroke-width="5" opacity=".72"/>
+    <path d="M0 64c-16 24 21 26 2 49s-17 34-5 49" fill="none" stroke="#a5f3fc" stroke-width="4" stroke-linecap="round"/>
+    <path d="m-1 104-15-10m16 34 15-10" fill="none" stroke="#a5f3fc" stroke-width="4" stroke-linecap="round"/>
+  </g>
+
+  <text x="290" y="151" fill="#f8fafc" font-family="system-ui,-apple-system,'Segoe UI',sans-serif" font-size="72" font-weight="750" letter-spacing="-2">Kite</text>
+  <text x="294" y="197" fill="#b9c7e6" font-family="system-ui,-apple-system,'Segoe UI',sans-serif" font-size="24" letter-spacing=".2">LOCAL AI, ON YOUR TERMS</text>
+  <path d="M294 225h450" stroke="#51668e" stroke-width="1" opacity=".8"/>
+  <text x="294" y="267" fill="#e0e8f7" font-family="system-ui,-apple-system,'Segoe UI',sans-serif" font-size="21">A calm, self-hosted home for your Ollama models.</text>
+
+  <!-- Rust gear emblem, drawn locally as SVG paths -->
+  <g transform="translate(910 177)" fill="none" stroke="#f97316" stroke-width="9" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M0-61v-17m0 156V61m61 0h17M-78 0h17m43-43 12-12m-55 110 12-12m86 0 12 12M-55-55l12 12"/>
+    <circle r="49"/>
+    <circle r="17"/>
+    <path d="M-49-21h-16m130 0H49M-49 21h-16m130 0H49"/>
+  </g>
+
+  <!-- Ollama-inspired connected-node emblem -->
+  <g transform="translate(1055 177)" fill="none" stroke="#7dd3a7" stroke-width="7" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M-34-19 0-39 34-19v39L0 40-34 20Z"/>
+    <path d="m-34-19 34 20 34-20M0 1v39"/>
+    <circle cx="-34" cy="-19" r="7" fill="#7dd3a7" stroke="none"/>
+    <circle cx="34" cy="-19" r="7" fill="#7dd3a7" stroke="none"/>
+    <circle cy="40" r="7" fill="#7dd3a7" stroke="none"/>
+  </g>
+  <text x="910" y="270" text-anchor="middle" fill="#c8d4e9" font-family="system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" letter-spacing="1.4">RUST</text>
+  <text x="1055" y="270" text-anchor="middle" fill="#c8d4e9" font-family="system-ui,-apple-system,'Segoe UI',sans-serif" font-size="14" letter-spacing="1.4">OLLAMA</text>
+</svg>
