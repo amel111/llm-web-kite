@@ -790,7 +790,28 @@
     controller = new AbortController();
     var full = "";
     var lastUsage = null;
+    var loadingToast = false;
+    var toastFinished = false;
+    var loadingToastTimer = setTimeout(function () {
+      if (toastFinished) return;
+      loadingToast = true;
+      snack("Loading model (" + currentModel.replace(":latest", "") + ")…");
+    }, 350);
     forceScrollBottom();
+
+    fetch("/api/model_status").then(function (r) { return r.json(); }).then(function (status) {
+      if (toastFinished) return;
+      clearTimeout(loadingToastTimer);
+      if (status && !status.loaded) {
+        loadingToast = true;
+        snack("Loading model (" + (status.model || currentModel).replace(":latest", "") + ")…");
+      }
+    }).catch(function () {
+      if (!toastFinished) {
+        loadingToast = true;
+        snack("Loading model (" + currentModel.replace(":latest", "") + ")…");
+      }
+    });
 
     fetch(url, {
       method: "POST",
@@ -801,10 +822,16 @@
       if (!r.ok) throw new Error("HTTP " + r.status);
       return readStream(r.body.getReader(), row);
     }).then(function () {
+      toastFinished = true;
+      clearTimeout(loadingToastTimer);
       finishStream(row, full, lastUsage);
+      if (loadingToast) snack("Model ready");
     }).catch(function (e) {
+      toastFinished = true;
+      clearTimeout(loadingToastTimer);
       if (e && e.name === "AbortError") {
         finishStream(row, full, lastUsage);
+        if (loadingToast) snack("Model loading stopped");
       } else {
         row.classList.remove("stream-caret");
         var err = document.createElement("div");
@@ -813,6 +840,7 @@
         row.appendChild(err);
         streamActive = false;
         setSendState();
+        if (loadingToast) snack("Model load failed");
       }
     });
 
@@ -885,10 +913,12 @@
     var text = ta.value.trim();
     if (streamActive) { if (controller) controller.abort(); return; }
     if (!text) return;
+    var createdConversation = false;
     if (!convId) {
       var r = await fetch("/api/conversations/new", { method: "POST" });
       var d = await r.json();
       convId = d.id;
+      createdConversation = true;
       insertConvItem(convId, text.slice(0, 40));
     }
     emptyEl.style.display = "none";
@@ -896,7 +926,7 @@
     autosize();
     buildUserRow({ role: "user", id: null, content: text });
     forceScrollBottom();
-    streamReply({ conversation_id: convId, message: text }, "/api/chat/send");
+    streamReply({ conversation_id: convId, message: text, skip_add_user: createdConversation }, "/api/chat/send");
   }
   sendBtn.addEventListener("click", send);
   ta.addEventListener("keydown", function (e) {

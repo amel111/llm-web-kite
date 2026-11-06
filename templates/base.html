@@ -15,7 +15,8 @@
 {% block body %}{% endblock %}
 <div class="snackbar" id="snack"></div>
 <script>
-function snack(msg){var e=document.getElementById("snack");e.textContent=msg;e.classList.add("show");setTimeout(function(){e.classList.remove("show");},2500);}
+var snackTimer;
+function snack(msg){var e=document.getElementById("snack");e.textContent=msg;e.classList.add("show");clearTimeout(snackTimer);snackTimer=setTimeout(function(){e.classList.remove("show");},2500);}
 </script>
 <script src="/static/vendor/marked.min.js"></script>
 <script src="/static/vendor/purify.min.js"></script>
